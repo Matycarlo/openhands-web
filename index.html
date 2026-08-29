@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenHands · Traductor LSC en vivo</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div id="app-root" class="app-root">
+
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-logo"></div>
+        <div class="brand-text">
+          <h1>OpenHands</h1>
+          <p>traductor LSC ⇄ voz, en vivo</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button id="open-call-panel" class="btn btn-outline">
+          📞 Videollamada
+        </button>
+        <button id="table-mode-button" class="btn btn-outline">
+          <span class="rotate-icon">↻</span> Modo mesa
+        </button>
+        <button id="open-training-panel" class="btn btn-outline">
+          🎓 Entrenar señas
+        </button>
+      </div>
+    </header>
+
+    <main class="panels">
+
+      <!-- ---------------- Panel: Persona sorda ---------------- -->
+      <section class="panel panel-signer">
+        <div class="panel-label label-green">
+          <span class="dot dot-green"></span>
+          PERSONA SORDA · LEE Y FIRMA
+        </div>
+
+        <div class="signer-body">
+          <div class="video-wrapper">
+            <video id="camera-preview" autoplay playsinline muted></video>
+            <canvas id="hand-canvas"></canvas>
+            <div id="camera-placeholder" class="camera-placeholder">
+              Cámara desactivada
+            </div>
+            <button id="camera-toggle-button" class="device-toggle-button" title="Apagar/encender cámara">
+              📷
+            </button>
+          </div>
+
+          <div class="listener-speech-box">
+            <p id="listener-speech-text" class="listener-speech-text">
+              Aquí aparecerá, en grande, lo que diga la persona oyente...
+            </p>
+          </div>
+        </div>
+
+        <div class="recognized-row">
+          <div id="recognized-words" class="recognized-words">
+            <!-- las burbujas de palabras reconocidas se insertan aquí por JS -->
+          </div>
+
+          <div class="signer-status">
+            <span id="hand-status" class="hand-status">sin mano detectada</span>
+          </div>
+        </div>
+
+        <div id="landmarks-info" class="landmarks-info">
+          Sin manos detectadas — vector de landmarks no disponible.
+        </div>
+
+        <div id="recognition-status" class="landmarks-info">
+          Aún no hay señas entrenadas. Abre "Entrenar señas" para grabar al menos una.
+        </div>
+
+        <div class="signer-controls">
+          <button id="backspace-button" class="btn btn-icon" title="Borrar última palabra">⌫</button>
+          <button id="clear-phrase-button" class="btn btn-outline">Limpiar frase</button>
+          <button id="reset-all-button" class="btn btn-outline">↺ Reiniciar todo</button>
+          <button id="send-to-listener-button" class="btn btn-primary">Enviar al oyente →</button>
+        </div>
+      </section>
+
+      <!-- ---------------- Panel: Oyente ---------------- -->
+      <section class="panel panel-listener">
+        <div class="panel-label label-amber">
+          <span class="dot dot-amber"></span>
+          OYENTE · HABLA Y ESCUCHA
+        </div>
+
+        <div class="listener-body">
+          <button id="mic-button" class="mic-button" title="Activar/desactivar micrófono">
+            <span class="mic-icon">🎙️</span>
+          </button>
+
+          <div class="signer-speech-box">
+            <p id="signer-speech-text" class="signer-speech-text">
+              Lo que la persona sorda firme y envíe aparecerá aquí como texto (y se puede leer en voz alta).
+            </p>
+          </div>
+        </div>
+
+        <div class="listener-footer">
+          <span id="mic-status" class="mic-status">micrófono apagado</span>
+          <button id="read-aloud-button" class="btn btn-outline">🔊 Leer en voz alta</button>
+        </div>
+      </section>
+
+    </main>
+
+    <div id="global-status" class="global-status">esperando actividad…</div>
+
+    <!-- ---------------- Panel lateral: Entrenar señas ---------------- -->
+    <aside id="training-panel" class="training-panel">
+      <div class="training-panel-header">
+        <h2>Entrenar señas</h2>
+        <button id="close-training-panel" class="btn-icon" title="Cerrar">✕</button>
+      </div>
+
+      <div class="training-panel-body">
+        <label class="field-label" for="gesture-name-input">Nombre de la seña / palabra</label>
+        <input id="gesture-name-input" type="text" class="text-input" placeholder="Ej: HOLA" />
+
+        <div id="quick-vocab-buttons" class="quick-vocab-buttons">
+          <button class="chip-button" data-word="HOLA">HOLA</button>
+          <button class="chip-button" data-word="GRACIAS">GRACIAS</button>
+          <button class="chip-button" data-word="POR FAVOR">POR FAVOR</button>
+          <button class="chip-button" data-word="SI">SI</button>
+          <button class="chip-button" data-word="NO">NO</button>
+          <button class="chip-button" data-word="AYUDA">AYUDA</button>
+          <button class="chip-button" data-word="BAÑO">BAÑO</button>
+          <button class="chip-button" data-word="AGUA">AGUA</button>
+        </div>
+
+        <button id="record-samples-button" class="btn btn-primary btn-block">
+          <span class="record-dot"></span> Grabar 15 muestras
+        </button>
+
+        <p class="training-hint">
+          Mantén la mano visible y haz la seña de forma estable mientras se capturan las
+          muestras. Repite en 2-3 sesiones con variaciones de ángulo/luz para mejor precisión.
+        </p>
+
+        <h3 class="training-subtitle">Vocabulario entrenado</h3>
+        <div id="vocabulary-list" class="vocabulary-list">
+          <!-- filas generadas por JS -->
+        </div>
+
+                <button id="import-official-vocab-button" class="btn btn-primary btn-block">
+          📥 Cargar señas oficiales
+        </button>
+
+        <div class="vocab-io-row">
+          <button id="export-vocab-button" class="btn btn-outline">⬇ Exportar</button>
+          <button id="import-vocab-button" class="btn btn-outline">⬆ Importar archivo</button>
+          <input id="import-vocab-file" type="file" accept="application/json" style="display: none;" />
+        </div>
+
+        <h3 class="training-subtitle">Sensibilidad de reconocimiento</h3>
+        <div class="sensitivity-row">
+          <span class="sensitivity-label">estricto</span>
+          <input id="sensitivity-slider" type="range" min="0" max="100" value="50" />
+          <span class="sensitivity-label">flexible</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ---------------- Panel lateral: Videollamada ---------------- -->
+    <aside id="call-panel" class="call-panel">
+      <div class="training-panel-header">
+        <h2>Videollamada</h2>
+        <button id="close-call-panel" class="btn-icon" title="Cerrar">✕</button>
+      </div>
+
+      <div class="training-panel-body">
+        <label class="field-label">Tu código (compártelo con la otra persona)</label>
+        <div class="my-id-row">
+          <input id="my-peer-id" type="text" class="text-input" readonly value="generando…" />
+          <button id="copy-my-id-button" class="btn btn-outline">Copiar</button>
+        </div>
+
+        <label class="field-label" for="remote-peer-id-input">Código de la otra persona</label>
+        <input id="remote-peer-id-input" type="text" class="text-input" placeholder="Pega aquí el código" />
+
+        <button id="call-button" class="btn btn-primary btn-block">📞 Llamar</button>
+        <button id="hang-up-button" class="btn btn-outline btn-block" style="display: none;">Colgar</button>
+
+        <p id="call-status" class="training-hint">Sin conexión.</p>
+      </div>
+    </aside>
+
+    <!-- ---------------- Video remoto (llamada activa) ---------------- -->
+    <div id="remote-video-box" class="remote-video-box" style="display: none;">
+      <video id="remote-video-preview" autoplay playsinline></video>
+      <span class="remote-video-label">Llamada en curso</span>
+    </div>
+
+  </div>
+
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
