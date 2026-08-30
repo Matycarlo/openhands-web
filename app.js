@@ -1,5 +1,30 @@
 import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
+// ---------------- Modo desarrollador ----------------
+
+const DEVELOPER_MODE_KEY = "openhands-developer-mode";
+const DEVELOPER_MODE_CODE = "TRALAKOMONOV";
+
+const openTrainingPanelButton = document.getElementById("open-training-panel");
+
+function isDeveloperModeEnabled() {
+  return localStorage.getItem(DEVELOPER_MODE_KEY) === "true";
+}
+
+function applyDeveloperModeVisibility() {
+  openTrainingPanelButton.style.display = isDeveloperModeEnabled() ? "" : "none";
+}
+
+function enableDeveloperMode() {
+  localStorage.setItem(DEVELOPER_MODE_KEY, "true");
+  applyDeveloperModeVisibility();
+  alert("Modo desarrollador activado. Ya puedes ver 'Entrenar señas' en el menú de arriba.");
+}
+
+applyDeveloperModeVisibility();
+
+// ---------------- Modo mesa ----------------
+
 const appRoot = document.getElementById("app-root");
 const tableModeButton = document.getElementById("table-mode-button");
 
@@ -12,6 +37,8 @@ function toggleTableMode() {
 }
 
 tableModeButton.addEventListener("click", toggleTableMode);
+
+// ---------------- Cámara ----------------
 
 const cameraPreview = document.getElementById("camera-preview");
 const cameraPlaceholder = document.getElementById("camera-placeholder");
@@ -79,6 +106,8 @@ cameraToggleButton.addEventListener("click", () => {
 });
 
 startCamera();
+
+// ---------------- Micrófono + reconocimiento de voz ----------------
 
 const micButton = document.getElementById("mic-button");
 const micStatus = document.getElementById("mic-status");
@@ -175,6 +204,8 @@ micButton.addEventListener("click", () => {
     startMic();
   }
 });
+
+// ---------------- Detección de manos (MediaPipe) ----------------
 
 const handCanvas = document.getElementById("hand-canvas");
 const handCanvasCtx = handCanvas.getContext("2d");
@@ -285,6 +316,8 @@ function drawHands(results) {
   }
 }
 
+// ---------------- Extracción y normalización de landmarks ----------------
+
 function normalizeLandmarks(landmarks) {
   const wrist = landmarks[0];
   const translated = landmarks.map((p) => ({
@@ -329,8 +362,9 @@ function updateLandmarksInfo(hands, handednessList) {
     `punta índice (p8): x=${fx.toFixed(2)}, y=${fy.toFixed(2)}, z=${fz.toFixed(2)}`;
 }
 
+// ---------------- Panel "Entrenar señas" ----------------
+
 const trainingPanel = document.getElementById("training-panel");
-const openTrainingPanelButton = document.getElementById("open-training-panel");
 const closeTrainingPanelButton = document.getElementById("close-training-panel");
 const gestureNameInput = document.getElementById("gesture-name-input");
 const recordSamplesButton = document.getElementById("record-samples-button");
@@ -350,6 +384,8 @@ document.querySelectorAll(".chip-button").forEach((button) => {
     gestureNameInput.value = button.dataset.word;
   });
 });
+
+// ---- Almacenamiento en el navegador (localStorage) ----
 
 const VOCAB_STORAGE_KEY = "openhands-vocabulary";
 const SENSITIVITY_STORAGE_KEY = "openhands-sensitivity";
@@ -409,6 +445,8 @@ function renderVocabularyList() {
     button.addEventListener("click", () => deleteGesture(button.dataset.name));
   });
 }
+
+// ---- Exportar / importar vocabulario (manual) ----
 
 const exportVocabButton = document.getElementById("export-vocab-button");
 const importVocabButton = document.getElementById("import-vocab-button");
@@ -471,7 +509,7 @@ importVocabFileInput.addEventListener("change", (event) => {
   importVocabFileInput.value = "";
 });
 
-// ---- Cargar señas oficiales (bundle incluido en el proyecto) ----
+// ---- Cargar señas oficiales (bundle incluido en el proyecto — visible para todos) ----
 
 const importOfficialVocabButton = document.getElementById("import-official-vocab-button");
 
@@ -513,6 +551,52 @@ importOfficialVocabButton.addEventListener("click", async () => {
   }
 });
 
+// ---- Guardar directamente como default-vocabulary.json (flujo de desarrollador) ----
+
+const saveOfficialVocabButton = document.getElementById("save-official-vocab-button");
+
+saveOfficialVocabButton.addEventListener("click", async () => {
+  if (Object.keys(vocabulary).length === 0) {
+    alert("No hay ningún vocabulario entrenado todavía para guardar.");
+    return;
+  }
+
+  const jsonText = JSON.stringify(vocabulary, null, 2);
+
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: "default-vocabulary.json",
+        types: [{ description: "Archivo JSON", accept: { "application/json": [".json"] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(jsonText);
+      await writable.close();
+      alert(
+        "Archivo guardado. Ahora en la terminal ejecuta:\n\n" +
+        "git add .\ngit commit -m \"Actualizar vocabulario\"\ngit push"
+      );
+      return;
+    } catch (error) {
+      if (error.name === "AbortError") return;
+      console.error("No se pudo guardar directamente:", error);
+    }
+  }
+
+  const blob = new Blob([jsonText], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "default-vocabulary.json";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+  alert("Se descargó a tu carpeta de Descargas. Muévelo a la carpeta del proyecto (ya con el nombre correcto).");
+});
+
+// ---- Sensibilidad de reconocimiento ----
+
 const MIN_THRESHOLD = 0.12;
 const MAX_THRESHOLD = 0.55;
 
@@ -530,6 +614,8 @@ sensitivitySlider.value = loadSensitivity();
 sensitivitySlider.addEventListener("input", () => {
   localStorage.setItem(SENSITIVITY_STORAGE_KEY, sensitivitySlider.value);
 });
+
+// ---- Captura de muestras ----
 
 const SAMPLES_PER_RECORDING = 15;
 
@@ -584,6 +670,8 @@ function captureSampleIfRecording() {
     }
   }
 }
+
+// ---------------- Reconocimiento por vecino más cercano (k-NN) ----------------
 
 const recognizedWordsContainer = document.getElementById("recognized-words");
 const recognitionStatus = document.getElementById("recognition-status");
@@ -650,8 +738,7 @@ function updateRecognitionStatus(candidate, distance, threshold) {
   const totalGestures = Object.keys(vocabulary).length;
 
   if (totalGestures === 0) {
-    recognitionStatus.textContent =
-      'Aún no hay señas entrenadas. Abre "Entrenar señas" para grabar al menos una.';
+    recognitionStatus.textContent = 'Aún no hay señas entrenadas. Usa "📥 Cargar señas" para empezar.';
     return;
   }
 
@@ -697,6 +784,8 @@ function processRecognition(vector) {
 
   updateRecognitionStatus(candidate, distance, threshold);
 }
+
+// ---------------- Texto a voz (voces mejoradas) ----------------
 
 function pickSpanishVoice() {
   const voices = window.speechSynthesis.getVoices();
@@ -750,6 +839,8 @@ readAloudButton.addEventListener("click", () => {
   speakText(text);
 });
 
+// ---------------- Controles de frase ----------------
+
 backspaceButton.addEventListener("click", () => {
   phraseWords.pop();
   renderPhrase();
@@ -777,6 +868,8 @@ sendToListenerButton.addEventListener("click", () => {
   speakText(text);
   sendCallData({ type: "sign_phrase", text });
 });
+
+// ---------------- Videollamadas (PeerJS) ----------------
 
 const callPanel = document.getElementById("call-panel");
 const openCallPanelButton = document.getElementById("open-call-panel");
@@ -886,6 +979,14 @@ function sendCallData(message) {
 
 callButton.addEventListener("click", async () => {
   const remoteId = remotePeerIdInput.value.trim();
+
+  // Código secreto: activa el modo desarrollador en vez de intentar llamar.
+  if (remoteId.toUpperCase() === DEVELOPER_MODE_CODE) {
+    enableDeveloperMode();
+    remotePeerIdInput.value = "";
+    return;
+  }
+
   if (!remoteId) {
     callStatus.textContent = "Escribe el código de la otra persona primero.";
     return;
@@ -925,6 +1026,8 @@ function endCall() {
 hangUpButton.addEventListener("click", endCall);
 
 initPeer();
+
+// ---------------- Bucle principal ----------------
 
 function predictLoop() {
   if (cameraStream && handLandmarker && cameraPreview.readyState >= 2) {

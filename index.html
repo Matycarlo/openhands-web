@@ -20,13 +20,16 @@
       </div>
 
       <div class="header-actions">
+        <button id="import-official-vocab-button" class="btn btn-outline">
+          📥 Cargar señas
+        </button>
         <button id="open-call-panel" class="btn btn-outline">
           📞 Videollamada
         </button>
         <button id="table-mode-button" class="btn btn-outline">
           <span class="rotate-icon">↻</span> Modo mesa
         </button>
-        <button id="open-training-panel" class="btn btn-outline">
+        <button id="open-training-panel" class="btn btn-outline" style="display: none;">
           🎓 Entrenar señas
         </button>
       </div>
@@ -75,7 +78,7 @@
         </div>
 
         <div id="recognition-status" class="landmarks-info">
-          Aún no hay señas entrenadas. Abre "Entrenar señas" para grabar al menos una.
+          Aún no hay señas entrenadas. Usa "📥 Cargar señas" para empezar.
         </div>
 
         <div class="signer-controls">
@@ -115,7 +118,7 @@
 
     <div id="global-status" class="global-status">esperando actividad…</div>
 
-    <!-- ---------------- Panel lateral: Entrenar señas ---------------- -->
+    <!-- ---------------- Panel lateral: Entrenar señas (solo modo desarrollador) ---------------- -->
     <aside id="training-panel" class="training-panel">
       <div class="training-panel-header">
         <h2>Entrenar señas</h2>
@@ -151,12 +154,11 @@
           <!-- filas generadas por JS -->
         </div>
 
-                <button id="import-official-vocab-button" class="btn btn-primary btn-block">
-          📥 Cargar señas oficiales
+        <button id="save-official-vocab-button" class="btn btn-outline btn-block">
+          💾 Guardar como archivo oficial (para ti)
         </button>
 
         <div class="vocab-io-row">
-          
           <button id="export-vocab-button" class="btn btn-outline">⬇ Exportar</button>
           <button id="import-vocab-button" class="btn btn-outline">⬆ Importar archivo</button>
           <input id="import-vocab-file" type="file" accept="application/json" style="display: none;" />
