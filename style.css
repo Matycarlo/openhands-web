@@ -593,12 +593,20 @@ html, body {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
   z-index: 60;
   background-color: var(--bg-tertiary);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.remote-video-box.dragging {
+  cursor: grabbing;
 }
 
 .remote-video-box video {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  pointer-events: none;
 }
 
 .remote-video-label {
@@ -610,6 +618,7 @@ html, body {
   background-color: rgba(0, 0, 0, 0.6);
   padding: 2px 8px;
   border-radius: 999px;
+  pointer-events: none;
 }
 
 @media (min-width: 900px) {

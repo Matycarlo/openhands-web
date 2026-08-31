@@ -1,2 +1,10 @@
 python -m http.server 8000
 http://localhost:8000/
+
+entrenar señas
+guardar como 'default-vocabulary.json
+meter las señas en openhands
+git status
+git add .
+git commit -m "Actualizar vocabulario oficial"
+git push

@@ -318,10 +318,45 @@ function drawHands(results) {
 
 // ---------------- Extracción y normalización de landmarks ----------------
 
+/**
+ * Calcula la "lateralidad geométrica" de la mano directamente a partir
+ * de sus propios landmarks, SIN depender de la clasificación
+ * Izquierda/Derecha de MediaPipe (que puede equivocarse o titubear).
+ *
+ * Se usa el producto cruz (en el plano de la imagen) entre el vector
+ * muñeca->base del índice y muñeca->base del meñique. El signo de ese
+ * producto cruz es consistentemente distinto entre una mano y su
+ * espejo, sin importar en qué ángulo esté — es pura geometría, no una
+ * predicción de un modelo que puede fallar.
+ */
+function computeChiralitySign(landmarks) {
+  const wrist = landmarks[0];
+  const indexMcp = landmarks[5];
+  const pinkyMcp = landmarks[17];
+
+  const v1x = indexMcp.x - wrist.x;
+  const v1y = indexMcp.y - wrist.y;
+  const v2x = pinkyMcp.x - wrist.x;
+  const v2y = pinkyMcp.y - wrist.y;
+
+  const crossZ = v1x * v2y - v1y * v2x;
+  return crossZ >= 0 ? 1 : -1;
+}
+
+/**
+ * Normaliza los 21 landmarks de una mano:
+ *  1. Traslación: se resta la muñeca (landmark 0), quedando en el origen.
+ *  2. Espejo por lateralidad (calculado geométricamente, ver arriba):
+ *     así, una seña hecha con la mano izquierda y la misma seña hecha
+ *     con la derecha producen el MISMO vector numérico.
+ *  3. Escala: se divide por la distancia máxima a la muñeca.
+ */
 function normalizeLandmarks(landmarks) {
   const wrist = landmarks[0];
+  const mirror = computeChiralitySign(landmarks);
+
   const translated = landmarks.map((p) => ({
-    x: p.x - wrist.x,
+    x: (p.x - wrist.x) * mirror,
     y: p.y - wrist.y,
     z: p.z - wrist.z,
   }));
@@ -346,11 +381,11 @@ function updateLandmarksInfo(hands, handednessList) {
     return;
   }
 
-  const vector = normalizeLandmarks(hands[0]);
   const label =
     handednessList && handednessList[0] && handednessList[0][0]
       ? handednessList[0][0].categoryName
       : "Desconocida";
+  const vector = normalizeLandmarks(hands[0]);
 
   const fingertipIndex = 8;
   const fx = vector[fingertipIndex * 3 + 0];
@@ -358,8 +393,69 @@ function updateLandmarksInfo(hands, handednessList) {
   const fz = vector[fingertipIndex * 3 + 2];
 
   landmarksInfo.textContent =
-    `Mano 1 (${label}) — vector normalizado: ${vector.length} valores | ` +
+    `Mano 1 (MediaPipe dice: ${label}) — vector normalizado: ${vector.length} valores | ` +
     `punta índice (p8): x=${fx.toFixed(2)}, y=${fy.toFixed(2)}, z=${fz.toFixed(2)}`;
+}
+
+// ---------------- Aumento de datos: rotaciones sintéticas ----------------
+
+function randomRotationMatrix(maxDegrees) {
+  const maxRad = (maxDegrees * Math.PI) / 180;
+  const rx = (Math.random() * 2 - 1) * maxRad;
+  const ry = (Math.random() * 2 - 1) * maxRad;
+  const rz = (Math.random() * 2 - 1) * maxRad;
+
+  const cosX = Math.cos(rx), sinX = Math.sin(rx);
+  const cosY = Math.cos(ry), sinY = Math.sin(ry);
+  const cosZ = Math.cos(rz), sinZ = Math.sin(rz);
+
+  const rotX = [[1, 0, 0], [0, cosX, -sinX], [0, sinX, cosX]];
+  const rotY = [[cosY, 0, sinY], [0, 1, 0], [-sinY, 0, cosY]];
+  const rotZ = [[cosZ, -sinZ, 0], [sinZ, cosZ, 0], [0, 0, 1]];
+
+  function multiply(a, b) {
+    const result = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (let i = 0; i < 3; i++) {
+      for (let j = 0; j < 3; j++) {
+        for (let k = 0; k < 3; k++) {
+          result[i][j] += a[i][k] * b[k][j];
+        }
+      }
+    }
+    return result;
+  }
+
+  return multiply(multiply(rotZ, rotY), rotX);
+}
+
+function applyRotation(vector, matrix) {
+  const rotated = [];
+  for (let i = 0; i < 21; i++) {
+    const x = vector[i * 3 + 0];
+    const y = vector[i * 3 + 1];
+    const z = vector[i * 3 + 2];
+    rotated.push(
+      matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z,
+      matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z,
+      matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z
+    );
+  }
+  return rotated;
+}
+
+const AUGMENTATION_COPIES = 4;
+const AUGMENTATION_MAX_DEGREES = 25;
+const AUGMENTATION_NOISE_STD = 0.015;
+
+function augmentSample(vector) {
+  const augmented = [];
+  for (let c = 0; c < AUGMENTATION_COPIES; c++) {
+    const matrix = randomRotationMatrix(AUGMENTATION_MAX_DEGREES);
+    const rotated = applyRotation(vector, matrix);
+    const noisy = rotated.map((v) => v + (Math.random() * 2 - 1) * AUGMENTATION_NOISE_STD);
+    augmented.push(noisy);
+  }
+  return augmented;
 }
 
 // ---------------- Panel "Entrenar señas" ----------------
@@ -647,7 +743,12 @@ function finishRecordingSamples(success) {
     return;
   }
 
-  addSamplesToVocabulary(currentGestureName, captureBuffer);
+  const expandedBuffer = [];
+  for (const sample of captureBuffer) {
+    expandedBuffer.push(sample, ...augmentSample(sample));
+  }
+
+  addSamplesToVocabulary(currentGestureName, expandedBuffer);
   captureBuffer = [];
   renderVocabularyList();
 }
@@ -883,6 +984,47 @@ const callStatus = document.getElementById("call-status");
 const remoteVideoBox = document.getElementById("remote-video-box");
 const remoteVideoPreview = document.getElementById("remote-video-preview");
 
+let isDraggingRemoteVideo = false;
+let dragOffsetX = 0;
+let dragOffsetY = 0;
+
+remoteVideoBox.addEventListener("pointerdown", (event) => {
+  isDraggingRemoteVideo = true;
+  remoteVideoBox.classList.add("dragging");
+
+  const rect = remoteVideoBox.getBoundingClientRect();
+  dragOffsetX = event.clientX - rect.left;
+  dragOffsetY = event.clientY - rect.top;
+
+  remoteVideoBox.style.left = `${rect.left}px`;
+  remoteVideoBox.style.top = `${rect.top}px`;
+  remoteVideoBox.style.right = "auto";
+  remoteVideoBox.style.bottom = "auto";
+
+  remoteVideoBox.setPointerCapture(event.pointerId);
+});
+
+remoteVideoBox.addEventListener("pointermove", (event) => {
+  if (!isDraggingRemoteVideo) return;
+
+  const newLeft = event.clientX - dragOffsetX;
+  const newTop = event.clientY - dragOffsetY;
+
+  const maxLeft = window.innerWidth - remoteVideoBox.offsetWidth;
+  const maxTop = window.innerHeight - remoteVideoBox.offsetHeight;
+
+  remoteVideoBox.style.left = `${Math.min(Math.max(0, newLeft), maxLeft)}px`;
+  remoteVideoBox.style.top = `${Math.min(Math.max(0, newTop), maxTop)}px`;
+});
+
+function stopDraggingRemoteVideo() {
+  isDraggingRemoteVideo = false;
+  remoteVideoBox.classList.remove("dragging");
+}
+
+remoteVideoBox.addEventListener("pointerup", stopDraggingRemoteVideo);
+remoteVideoBox.addEventListener("pointercancel", stopDraggingRemoteVideo);
+
 let peer = null;
 let currentCall = null;
 let dataConnection = null;
@@ -980,7 +1122,6 @@ function sendCallData(message) {
 callButton.addEventListener("click", async () => {
   const remoteId = remotePeerIdInput.value.trim();
 
-  // Código secreto: activa el modo desarrollador en vez de intentar llamar.
   if (remoteId.toUpperCase() === DEVELOPER_MODE_CODE) {
     enableDeveloperMode();
     remotePeerIdInput.value = "";
