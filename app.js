@@ -319,28 +319,32 @@ function drawHands(results) {
 // ---------------- Extracción y normalización de landmarks ----------------
 
 /**
- * Calcula la "lateralidad geométrica" de la mano directamente a partir
- * de sus propios landmarks, SIN depender de la clasificación
- * Izquierda/Derecha de MediaPipe (que puede equivocarse o titubear).
- *
- * Se usa el producto cruz (en el plano de la imagen) entre el vector
- * muñeca->base del índice y muñeca->base del meñique. El signo de ese
- * producto cruz es consistentemente distinto entre una mano y su
- * espejo, sin importar en qué ángulo esté — es pura geometría, no una
- * predicción de un modelo que puede fallar.
+ * Calcula la lateralidad geométrica usando un "producto triple" en 3D
+ * (X, Y, Z) en vez de solo 2D. Esto es importante porque señas con
+ * movimiento (como "Hola", un saludo) inclinan la mano hacia la cámara
+ * en distintos ángulos de profundidad — un cálculo solo en 2D (X, Y) se
+ * confunde con esa inclinación y a veces detecta mal la lateralidad. El
+ * producto triple en 3D da el mismo resultado sin importar en qué
+ * ángulo esté rotada la mano, y solo cambia de signo si es realmente
+ * la mano contraria (un espejo real, no solo un giro).
  */
 function computeChiralitySign(landmarks) {
   const wrist = landmarks[0];
   const indexMcp = landmarks[5];
+  const middleMcp = landmarks[9];
   const pinkyMcp = landmarks[17];
 
-  const v1x = indexMcp.x - wrist.x;
-  const v1y = indexMcp.y - wrist.y;
-  const v2x = pinkyMcp.x - wrist.x;
-  const v2y = pinkyMcp.y - wrist.y;
+  const v1 = { x: indexMcp.x - wrist.x, y: indexMcp.y - wrist.y, z: indexMcp.z - wrist.z };
+  const v2 = { x: middleMcp.x - wrist.x, y: middleMcp.y - wrist.y, z: middleMcp.z - wrist.z };
+  const v3 = { x: pinkyMcp.x - wrist.x, y: pinkyMcp.y - wrist.y, z: pinkyMcp.z - wrist.z };
 
-  const crossZ = v1x * v2y - v1y * v2x;
-  return crossZ >= 0 ? 1 : -1;
+  const crossX = v2.y * v3.z - v2.z * v3.y;
+  const crossY = v2.z * v3.x - v2.x * v3.z;
+  const crossZ = v2.x * v3.y - v2.y * v3.x;
+
+  const tripleProduct = v1.x * crossX + v1.y * crossY + v1.z * crossZ;
+
+  return tripleProduct >= 0 ? 1 : -1;
 }
 
 /**
