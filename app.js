@@ -55,8 +55,11 @@ async function startCamera() {
   }
 
   try {
+    // Resolución reducida a propósito: una imagen más chica se procesa
+    // MUCHO más rápido (el modelo de manos la reduce internamente de
+    // todos modos), sin perder precisión real en la detección.
     cameraStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      video: { width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false,
     });
 
@@ -95,6 +98,8 @@ function stopCamera() {
   handStatus.textContent = "sin mano detectada";
   landmarksInfo.textContent = "Sin manos detectadas — vector de landmarks no disponible.";
   handCanvasCtx.clearRect(0, 0, handCanvas.width, handCanvas.height);
+  resetChiralityState();
+  missedFrameCount = 0;
 }
 
 cameraToggleButton.addEventListener("click", () => {
@@ -238,7 +243,20 @@ async function initHandLandmarker() {
         delegate: "GPU",
       },
       runningMode: "VIDEO",
+      // Hasta 2 manos: si se deja en 1, MediaPipe descarta la segunda
+      // mano aunque esté presente en el encuadre. El reconocimiento de
+      // la seña sigue usando solo la mano principal (results.landmarks[0]),
+      // pero con esto ambas manos se detectan y se dibujan correctamente.
       numHands: 2,
+      // Subido de 0.3: con ese valor el detector era muy permisivo y a
+      // veces confundía la cara (u otra zona de piel) con una mano, o
+      // dejaba un "fantasma" de mano flotando en el aire un rato
+      // después de que la mano real ya no estaba en el encuadre. Con
+      // umbrales más altos exige más certeza antes de decir "esto es
+      // una mano".
+      minHandDetectionConfidence: 0.6,
+      minHandPresenceConfidence: 0.6,
+      minTrackingConfidence: 0.5,
     });
 
     globalStatus.textContent = "cámara activa, esperando actividad…";
@@ -318,17 +336,31 @@ function drawHands(results) {
 
 // ---------------- Extracción y normalización de landmarks ----------------
 
-/**
- * Calcula la lateralidad geométrica usando un "producto triple" en 3D
- * (X, Y, Z) en vez de solo 2D. Esto es importante porque señas con
- * movimiento (como "Hola", un saludo) inclinan la mano hacia la cámara
- * en distintos ángulos de profundidad — un cálculo solo en 2D (X, Y) se
- * confunde con esa inclinación y a veces detecta mal la lateralidad. El
- * producto triple en 3D da el mismo resultado sin importar en qué
- * ángulo esté rotada la mano, y solo cambia de signo si es realmente
- * la mano contraria (un espejo real, no solo un giro).
- */
-function computeChiralitySign(landmarks) {
+const MIN_HAND_SIZE_THRESHOLD = 0.15;
+
+function computeHandSizeInFrame(landmarks) {
+  const wrist = landmarks[0];
+  let maxDistance = 0;
+  for (const p of landmarks) {
+    const dx = p.x - wrist.x;
+    const dy = p.y - wrist.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    if (distance > maxDistance) maxDistance = distance;
+  }
+  return maxDistance;
+}
+
+// Memoria de lateralidad POR MANO (índice 0 y 1), no compartida entre
+// ambas. Antes había una sola variable global: si en un mismo
+// fotograma se procesaban dos manos, la segunda pisaba la memoria de
+// la primera y podía arruinar el espejo de cualquiera de las dos.
+let lastStableChiralitySigns = [null, null];
+
+function resetChiralityState() {
+  lastStableChiralitySigns = [null, null];
+}
+
+function computeChiralitySign(landmarks, handIndex) {
   const wrist = landmarks[0];
   const indexMcp = landmarks[5];
   const middleMcp = landmarks[9];
@@ -343,21 +375,23 @@ function computeChiralitySign(landmarks) {
   const crossZ = v2.x * v3.y - v2.y * v3.x;
 
   const tripleProduct = v1.x * crossX + v1.y * crossY + v1.z * crossZ;
+  const currentSign = tripleProduct >= 0 ? 1 : -1;
 
-  return tripleProduct >= 0 ? 1 : -1;
+  const CHIRALITY_CONFIDENCE_THRESHOLD = 0.0004;
+
+  if (
+    lastStableChiralitySigns[handIndex] === null ||
+    Math.abs(tripleProduct) > CHIRALITY_CONFIDENCE_THRESHOLD
+  ) {
+    lastStableChiralitySigns[handIndex] = currentSign;
+  }
+
+  return lastStableChiralitySigns[handIndex];
 }
 
-/**
- * Normaliza los 21 landmarks de una mano:
- *  1. Traslación: se resta la muñeca (landmark 0), quedando en el origen.
- *  2. Espejo por lateralidad (calculado geométricamente, ver arriba):
- *     así, una seña hecha con la mano izquierda y la misma seña hecha
- *     con la derecha producen el MISMO vector numérico.
- *  3. Escala: se divide por la distancia máxima a la muñeca.
- */
-function normalizeLandmarks(landmarks) {
+function normalizeLandmarks(landmarks, handIndex = 0) {
   const wrist = landmarks[0];
-  const mirror = computeChiralitySign(landmarks);
+  const mirror = computeChiralitySign(landmarks, handIndex);
 
   const translated = landmarks.map((p) => ({
     x: (p.x - wrist.x) * mirror,
@@ -434,7 +468,8 @@ function randomRotationMatrix(maxDegrees) {
 
 function applyRotation(vector, matrix) {
   const rotated = [];
-  for (let i = 0; i < 21; i++) {
+  const numPoints = vector.length / 3;
+  for (let i = 0; i < numPoints; i++) {
     const x = vector[i * 3 + 0];
     const y = vector[i * 3 + 1];
     const z = vector[i * 3 + 2];
@@ -723,6 +758,8 @@ let isRecording = false;
 let captureBuffer = [];
 let currentGestureName = "";
 let lastNormalizedVector = null;
+let lastCaptureTime = 0;
+const CAPTURE_INTERVAL_MS = 150;
 
 function startRecordingSamples() {
   const name = gestureNameInput.value.trim().toUpperCase();
@@ -732,6 +769,7 @@ function startRecordingSamples() {
   }
   currentGestureName = name;
   captureBuffer = [];
+  lastCaptureTime = 0;
   isRecording = true;
   recordSamplesButton.disabled = true;
 }
@@ -765,14 +803,17 @@ recordSamplesButton.addEventListener("click", () => {
 
 function captureSampleIfRecording() {
   if (!isRecording) return;
+  if (!lastNormalizedVector) return;
 
-  if (lastNormalizedVector) {
-    captureBuffer.push(lastNormalizedVector);
-    recordSamplesButton.textContent = `Grabando... ${captureBuffer.length}/${SAMPLES_PER_RECORDING}`;
+  const now = performance.now();
+  if (now - lastCaptureTime < CAPTURE_INTERVAL_MS) return;
+  lastCaptureTime = now;
 
-    if (captureBuffer.length >= SAMPLES_PER_RECORDING) {
-      finishRecordingSamples(true);
-    }
+  captureBuffer.push(lastNormalizedVector);
+  recordSamplesButton.textContent = `Grabando... ${captureBuffer.length}/${SAMPLES_PER_RECORDING}`;
+
+  if (captureBuffer.length >= SAMPLES_PER_RECORDING) {
+    finishRecordingSamples(true);
   }
 }
 
@@ -797,31 +838,95 @@ let recentCount = 0;
 let confirmedLabel = null;
 
 const CONFIRM_FRAMES = 8;
+const K_NEAREST = 7;
+const HAND_VECTOR_LENGTH = 63; // 21 landmarks x (x, y, z)
 
-function euclideanDistance(a, b) {
+/**
+ * Distancia euclidiana AL CUADRADO (sin la raíz). Para comparar y
+ * ordenar por cercanía da exactamente el mismo resultado que la
+ * distancia real (si a² < b² entonces a < b), pero evita calcular
+ * Math.sqrt miles de veces por fotograma — eso era buena parte del
+ * lag: classifyVector corre en cada fotograma y antes sacaba raíz
+ * cuadrada por CADA muestra del vocabulario completo. Ahora solo se
+ * saca raíz al final, para los pocos vecinos ya seleccionados.
+ */
+function squaredDistance(a, b) {
   let sum = 0;
   for (let i = 0; i < a.length; i++) {
     const diff = a[i] - b[i];
     sum += diff * diff;
   }
-  return Math.sqrt(sum);
+  return sum;
+}
+
+/**
+ * Distancia AL CUADRADO entre el vector actual y una muestra guardada.
+ *
+ * - Si ambos son de una sola mano (63 valores): distancia euclidiana
+ *   al cuadrado normal.
+ * - Si ambos son de dos manos (126 valores = dos manos concatenadas):
+ *   se prueba tal cual y también con las dos mitades intercambiadas,
+ *   y se usa la menor. Así no importa cuál mano haya quedado
+ *   "primero" al concatenar — lo que incluye el caso de una seña de
+ *   dos manos hecha en espejo completo (donde las dos manos
+ *   intercambian de posición y de forma). Se normaliza por la
+ *   cantidad de manos (dividiendo entre 2, ya que trabajamos al
+ *   cuadrado) para que el umbral de sensibilidad siga significando lo
+ *   mismo con dos manos.
+ */
+function vectorSquaredDistanceToSample(vector, sample) {
+  if (vector.length !== sample.length) return Infinity;
+
+  const numHandsInVector = vector.length / HAND_VECTOR_LENGTH;
+
+  if (numHandsInVector === 2) {
+    const direct = squaredDistance(vector, sample);
+    const swappedVector = [
+      ...vector.slice(HAND_VECTOR_LENGTH),
+      ...vector.slice(0, HAND_VECTOR_LENGTH),
+    ];
+    const swapped = squaredDistance(swappedVector, sample);
+    return Math.min(direct, swapped) / numHandsInVector;
+  }
+
+  return squaredDistance(vector, sample);
 }
 
 function classifyVector(vector) {
-  let bestName = null;
-  let bestDistance = Infinity;
-
+  const allDistances = [];
   for (const [name, samples] of Object.entries(vocabulary)) {
     for (const sample of samples) {
-      const distance = euclideanDistance(vector, sample);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestName = name;
-      }
+      allDistances.push({ name, sqDistance: vectorSquaredDistanceToSample(vector, sample) });
     }
   }
 
-  return { name: bestName, distance: bestDistance };
+  if (allDistances.length === 0) {
+    return { name: null, distance: Infinity };
+  }
+
+  allDistances.sort((a, b) => a.sqDistance - b.sqDistance);
+  const nearest = allDistances.slice(0, Math.min(K_NEAREST, allDistances.length));
+
+  const votes = {};
+  for (const neighbor of nearest) {
+    const distance = Math.sqrt(neighbor.sqDistance);
+    const weight = 1 / (distance + 1e-6);
+    votes[neighbor.name] = (votes[neighbor.name] || 0) + weight;
+  }
+
+  let bestName = null;
+  let bestVote = -Infinity;
+  for (const [name, vote] of Object.entries(votes)) {
+    if (vote > bestVote) {
+      bestVote = vote;
+      bestName = name;
+    }
+  }
+
+  const bestNeighbor = nearest.find((n) => n.name === bestName);
+  const bestNeighborDistance = Math.sqrt(bestNeighbor.sqDistance);
+
+  return { name: bestName, distance: bestNeighborDistance };
 }
 
 function confirmWord(word) {
@@ -1170,23 +1275,97 @@ function endCall() {
 
 hangUpButton.addEventListener("click", endCall);
 
+function closeAllCallResources() {
+  if (currentCall) {
+    currentCall.close();
+    currentCall = null;
+  }
+  if (dataConnection) {
+    dataConnection.close();
+    dataConnection = null;
+  }
+  if (peer) {
+    peer.destroy();
+  }
+}
+
+window.addEventListener("beforeunload", closeAllCallResources);
+window.addEventListener("pagehide", closeAllCallResources);
+
 initPeer();
 
 // ---------------- Bucle principal ----------------
 
+// Tolera hasta 6 fotogramas seguidos sin detección antes de "dar por
+// perdida" la mano. Así, un parpadeo momentáneo del detector (algo
+// completamente normal al mover la mano) no reinicia todo de golpe.
+let missedFrameCount = 0;
+const MAX_MISSED_FRAMES = 6;
+
+// El reconocimiento (comparar contra TODO el vocabulario) es lo más
+// pesado del bucle, y crece a medida que se entrenan más señas. Antes
+// se ejecutaba en cada fotograma (hasta 60 veces por segundo), lo cual
+// saturaba el hilo principal y causaba el lag de cámara / la demora en
+// "reaccionar" a la mano. Ahora se ejecuta 1 de cada 3 fotogramas —la
+// cámara y el dibujo del esqueleto siguen actualizándose en cada
+// fotograma, solo se espacía la parte pesada.
+let recognitionFrameCounter = 0;
+const RECOGNITION_FRAME_INTERVAL = 3;
+
 function predictLoop() {
   if (cameraStream && handLandmarker && cameraPreview.readyState >= 2) {
-    const results = handLandmarker.detectForVideo(cameraPreview, performance.now());
+    const rawResults = handLandmarker.detectForVideo(cameraPreview, performance.now());
+
+    // Se descartan por completo las manos demasiado chicas en el
+    // encuadre (mano muy alejada de la cámara): no se dibujan, no
+    // cuentan como "mano detectada" y no se usan para reconocer. Antes
+    // solo se anulaba el vector de reconocimiento pero el esqueleto
+    // seguía dibujándose y seguía contando como detección.
+    const rawLandmarks = rawResults.landmarks || [];
+    const rawHandedness = rawResults.handedness || [];
+    const keptIndices = [];
+    for (let i = 0; i < rawLandmarks.length; i++) {
+      if (computeHandSizeInFrame(rawLandmarks[i]) >= MIN_HAND_SIZE_THRESHOLD) {
+        keptIndices.push(i);
+      }
+    }
+    const results = {
+      landmarks: keptIndices.map((i) => rawLandmarks[i]),
+      handedness: keptIndices.map((i) => rawHandedness[i]),
+    };
+
     drawHands(results);
     updateLandmarksInfo(results.landmarks, results.handedness);
 
-    lastNormalizedVector =
-      results.landmarks && results.landmarks.length > 0
-        ? normalizeLandmarks(results.landmarks[0])
-        : null;
+    if (results.landmarks.length > 0) {
+      missedFrameCount = 0;
+      // Cada mano se normaliza por separado (con su propio espejo por
+      // lateralidad, usando su propio índice de memoria — ver arriba).
+      // Si hay dos manos, se concatenan en un solo vector para poder
+      // reconocer señas de dos manos. El orden en que queden no
+      // importa: vectorSquaredDistanceToSample prueba ambos órdenes,
+      // así una seña de dos manos también se reconoce si se hace en
+      // espejo (con los roles de las manos intercambiados).
+      const handVectors = results.landmarks
+        .slice(0, 2)
+        .map((lm, idx) => normalizeLandmarks(lm, idx));
+      lastNormalizedVector =
+        handVectors.length === 2 ? [...handVectors[0], ...handVectors[1]] : handVectors[0];
+    } else {
+      missedFrameCount++;
+      if (missedFrameCount > MAX_MISSED_FRAMES) {
+        lastNormalizedVector = null;
+        resetChiralityState();
+      }
+      // si no se superó el límite, se conserva el último vector válido
+    }
 
     if (!isRecording) {
-      processRecognition(lastNormalizedVector);
+      recognitionFrameCounter++;
+      if (recognitionFrameCounter >= RECOGNITION_FRAME_INTERVAL) {
+        recognitionFrameCounter = 0;
+        processRecognition(lastNormalizedVector);
+      }
     }
     captureSampleIfRecording();
   } else {
