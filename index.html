@@ -140,6 +140,14 @@
           <button class="chip-button" data-word="AGUA">AGUA</button>
         </div>
 
+        <h3 class="training-subtitle">Sensibilidad de reconocimiento</h3>
+        <div class="sensitivity-row">
+          <span class="sensitivity-label">estricto</span>
+          <input id="sensitivity-slider" type="range" min="0" max="100" value="50" />
+          <span class="sensitivity-label">flexible</span>
+        </div>
+        <p id="sensitivity-value-readout" class="training-hint">Umbral actual: 0.30</p>
+
         <button id="record-samples-button" class="btn btn-primary btn-block">
           <span class="record-dot"></span> Grabar 15 muestras
         </button>
@@ -162,13 +170,6 @@
           <button id="export-vocab-button" class="btn btn-outline">⬇ Exportar</button>
           <button id="import-vocab-button" class="btn btn-outline">⬆ Importar archivo</button>
           <input id="import-vocab-file" type="file" accept="application/json" style="display: none;" />
-        </div>
-
-        <h3 class="training-subtitle">Sensibilidad de reconocimiento</h3>
-        <div class="sensitivity-row">
-          <span class="sensitivity-label">estricto</span>
-          <input id="sensitivity-slider" type="range" min="0" max="100" value="50" />
-          <span class="sensitivity-label">flexible</span>
         </div>
       </div>
     </aside>

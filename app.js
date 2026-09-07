@@ -55,9 +55,6 @@ async function startCamera() {
   }
 
   try {
-    // Resolución reducida a propósito: una imagen más chica se procesa
-    // MUCHO más rápido (el modelo de manos la reduce internamente de
-    // todos modos), sin perder precisión real en la detección.
     cameraStream = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false,
@@ -243,20 +240,14 @@ async function initHandLandmarker() {
         delegate: "GPU",
       },
       runningMode: "VIDEO",
-      // Hasta 2 manos: si se deja en 1, MediaPipe descarta la segunda
-      // mano aunque esté presente en el encuadre. El reconocimiento de
-      // la seña sigue usando solo la mano principal (results.landmarks[0]),
-      // pero con esto ambas manos se detectan y se dibujan correctamente.
-      numHands: 2,
-      // Subido de 0.3: con ese valor el detector era muy permisivo y a
-      // veces confundía la cara (u otra zona de piel) con una mano, o
-      // dejaba un "fantasma" de mano flotando en el aire un rato
-      // después de que la mano real ya no estaba en el encuadre. Con
-      // umbrales más altos exige más certeza antes de decir "esto es
-      // una mano".
-      minHandDetectionConfidence: 0.6,
-      minHandPresenceConfidence: 0.6,
-      minTrackingConfidence: 0.5,
+            numHands: 2,
+      // Balance ajustado: más permisivo que antes para que la mano no
+      // "desaparezca" tan seguido, sin afectar el rendimiento (estos
+      // umbrales no cuestan tiempo de cómputo extra, solo cambian qué
+      // tan exigente es la decisión final).
+      minHandDetectionConfidence: 0.4,
+      minHandPresenceConfidence: 0.4,
+      minTrackingConfidence: 0.35,
     });
 
     globalStatus.textContent = "cámara activa, esperando actividad…";
@@ -350,10 +341,6 @@ function computeHandSizeInFrame(landmarks) {
   return maxDistance;
 }
 
-// Memoria de lateralidad POR MANO (índice 0 y 1), no compartida entre
-// ambas. Antes había una sola variable global: si en un mismo
-// fotograma se procesaban dos manos, la segunda pisaba la memoria de
-// la primera y podía arruinar el espejo de cualquiera de las dos.
 let lastStableChiralitySigns = [null, null];
 
 function resetChiralityState() {
@@ -505,6 +492,7 @@ const gestureNameInput = document.getElementById("gesture-name-input");
 const recordSamplesButton = document.getElementById("record-samples-button");
 const vocabularyList = document.getElementById("vocabulary-list");
 const sensitivitySlider = document.getElementById("sensitivity-slider");
+const sensitivityValueReadout = document.getElementById("sensitivity-value-readout");
 
 openTrainingPanelButton.addEventListener("click", () => {
   trainingPanel.classList.add("open");
@@ -745,9 +733,15 @@ function getCurrentThreshold() {
   return MIN_THRESHOLD + (value / 100) * (MAX_THRESHOLD - MIN_THRESHOLD);
 }
 
+function updateSensitivityReadout() {
+  sensitivityValueReadout.textContent = `Umbral actual: ${getCurrentThreshold().toFixed(2)}`;
+}
+
 sensitivitySlider.value = loadSensitivity();
+updateSensitivityReadout();
 sensitivitySlider.addEventListener("input", () => {
   localStorage.setItem(SENSITIVITY_STORAGE_KEY, sensitivitySlider.value);
+  updateSensitivityReadout();
 });
 
 // ---- Captura de muestras ----
@@ -759,7 +753,7 @@ let captureBuffer = [];
 let currentGestureName = "";
 let lastNormalizedVector = null;
 let lastCaptureTime = 0;
-const CAPTURE_INTERVAL_MS = 150;
+const CAPTURE_INTERVAL_MS = 100;
 
 function startRecordingSamples() {
   const name = gestureNameInput.value.trim().toUpperCase();
@@ -833,23 +827,21 @@ const DEFAULT_SIGNER_SPEECH_TEXT =
 const DEFAULT_LISTENER_SPEECH_TEXT = "Aquí aparecerá, en grande, lo que diga la persona oyente...";
 
 let phraseWords = [];
-let recentLabel = null;
-let recentCount = 0;
 let confirmedLabel = null;
 
-const CONFIRM_FRAMES = 8;
-const K_NEAREST = 7;
-const HAND_VECTOR_LENGTH = 63; // 21 landmarks x (x, y, z)
+// Ventana de confirmación: en vez de exigir 8 fotogramas SEGUIDOS
+// idénticos (lo cual fallaba apenas había un parpadeo del detector, y
+// entonces "coincide con X" se veía en el texto de depuración pero la
+// palabra nunca se confirmaba), ahora se guarda un historial de las
+// últimas 8 predicciones y se confirma por MAYORÍA (al menos 5 de 8),
+// tolerando hasta 3 fallos puntuales sin reiniciar todo el conteo.
+const CONFIRM_WINDOW_SIZE = 5;
+const CONFIRM_VOTES_NEEDED = 3;
+let recentCandidates = [];
 
-/**
- * Distancia euclidiana AL CUADRADO (sin la raíz). Para comparar y
- * ordenar por cercanía da exactamente el mismo resultado que la
- * distancia real (si a² < b² entonces a < b), pero evita calcular
- * Math.sqrt miles de veces por fotograma — eso era buena parte del
- * lag: classifyVector corre en cada fotograma y antes sacaba raíz
- * cuadrada por CADA muestra del vocabulario completo. Ahora solo se
- * saca raíz al final, para los pocos vecinos ya seleccionados.
- */
+const K_NEAREST = 7;
+const HAND_VECTOR_LENGTH = 63;
+
 function squaredDistance(a, b) {
   let sum = 0;
   for (let i = 0; i < a.length; i++) {
@@ -859,21 +851,6 @@ function squaredDistance(a, b) {
   return sum;
 }
 
-/**
- * Distancia AL CUADRADO entre el vector actual y una muestra guardada.
- *
- * - Si ambos son de una sola mano (63 valores): distancia euclidiana
- *   al cuadrado normal.
- * - Si ambos son de dos manos (126 valores = dos manos concatenadas):
- *   se prueba tal cual y también con las dos mitades intercambiadas,
- *   y se usa la menor. Así no importa cuál mano haya quedado
- *   "primero" al concatenar — lo que incluye el caso de una seña de
- *   dos manos hecha en espejo completo (donde las dos manos
- *   intercambian de posición y de forma). Se normaliza por la
- *   cantidad de manos (dividiendo entre 2, ya que trabajamos al
- *   cuadrado) para que el umbral de sensibilidad siga significando lo
- *   mismo con dos manos.
- */
 function vectorSquaredDistanceToSample(vector, sample) {
   if (vector.length !== sample.length) return Infinity;
 
@@ -965,8 +942,7 @@ function updateRecognitionStatus(candidate, distance, threshold) {
 
 function processRecognition(vector) {
   if (!vector || Object.keys(vocabulary).length === 0) {
-    recentLabel = null;
-    recentCount = 0;
+    recentCandidates = [];
     confirmedLabel = null;
     updateRecognitionStatus(null, null, null);
     return;
@@ -976,20 +952,33 @@ function processRecognition(vector) {
   const threshold = getCurrentThreshold();
   const candidate = name && distance <= threshold ? name : null;
 
-  if (candidate === recentLabel) {
-    recentCount++;
-  } else {
-    recentLabel = candidate;
-    recentCount = 1;
+  recentCandidates.push(candidate);
+  if (recentCandidates.length > CONFIRM_WINDOW_SIZE) {
+    recentCandidates.shift();
   }
 
-  if (candidate !== confirmedLabel) {
+  const windowVotes = {};
+  for (const c of recentCandidates) {
+    if (!c) continue;
+    windowVotes[c] = (windowVotes[c] || 0) + 1;
+  }
+
+  let windowWinner = null;
+  let windowWinnerVotes = 0;
+  for (const [name2, count] of Object.entries(windowVotes)) {
+    if (count > windowWinnerVotes) {
+      windowWinnerVotes = count;
+      windowWinner = name2;
+    }
+  }
+
+  if (windowWinner !== confirmedLabel) {
     confirmedLabel = null;
   }
 
-  if (candidate && recentCount >= CONFIRM_FRAMES && confirmedLabel !== candidate) {
-    confirmWord(candidate);
-    confirmedLabel = candidate;
+  if (windowWinner && windowWinnerVotes >= CONFIRM_VOTES_NEEDED && confirmedLabel !== windowWinner) {
+    confirmWord(windowWinner);
+    confirmedLabel = windowWinner;
   }
 
   updateRecognitionStatus(candidate, distance, threshold);
@@ -1296,31 +1285,21 @@ initPeer();
 
 // ---------------- Bucle principal ----------------
 
-// Tolera hasta 6 fotogramas seguidos sin detección antes de "dar por
-// perdida" la mano. Así, un parpadeo momentáneo del detector (algo
-// completamente normal al mover la mano) no reinicia todo de golpe.
+// Tolerancia subida de 6 a 10: cubre tanto "la mano se tapó un instante
+// con la otra mano" (habitual en señas de dos manos) como "se tapó con
+// otra cosa" — no hay forma técnica de distinguir la causa exacta, así
+// que se trata igual, priorizando no perder el reconocimiento a mitad
+// de una seña de dos manos.
 let missedFrameCount = 0;
-const MAX_MISSED_FRAMES = 6;
+const MAX_MISSED_FRAMES = 10;
 
-// El reconocimiento (comparar contra TODO el vocabulario) es lo más
-// pesado del bucle, y crece a medida que se entrenan más señas. Antes
-// se ejecutaba en cada fotograma (hasta 60 veces por segundo), lo cual
-// saturaba el hilo principal y causaba el lag de cámara / la demora en
-// "reaccionar" a la mano. Ahora se ejecuta 1 de cada 3 fotogramas —la
-// cámara y el dibujo del esqueleto siguen actualizándose en cada
-// fotograma, solo se espacía la parte pesada.
 let recognitionFrameCounter = 0;
-const RECOGNITION_FRAME_INTERVAL = 3;
+const RECOGNITION_FRAME_INTERVAL = 2;
 
 function predictLoop() {
   if (cameraStream && handLandmarker && cameraPreview.readyState >= 2) {
     const rawResults = handLandmarker.detectForVideo(cameraPreview, performance.now());
 
-    // Se descartan por completo las manos demasiado chicas en el
-    // encuadre (mano muy alejada de la cámara): no se dibujan, no
-    // cuentan como "mano detectada" y no se usan para reconocer. Antes
-    // solo se anulaba el vector de reconocimiento pero el esqueleto
-    // seguía dibujándose y seguía contando como detección.
     const rawLandmarks = rawResults.landmarks || [];
     const rawHandedness = rawResults.handedness || [];
     const keptIndices = [];
@@ -1339,13 +1318,6 @@ function predictLoop() {
 
     if (results.landmarks.length > 0) {
       missedFrameCount = 0;
-      // Cada mano se normaliza por separado (con su propio espejo por
-      // lateralidad, usando su propio índice de memoria — ver arriba).
-      // Si hay dos manos, se concatenan en un solo vector para poder
-      // reconocer señas de dos manos. El orden en que queden no
-      // importa: vectorSquaredDistanceToSample prueba ambos órdenes,
-      // así una seña de dos manos también se reconoce si se hace en
-      // espejo (con los roles de las manos intercambiados).
       const handVectors = results.landmarks
         .slice(0, 2)
         .map((lm, idx) => normalizeLandmarks(lm, idx));
@@ -1357,7 +1329,6 @@ function predictLoop() {
         lastNormalizedVector = null;
         resetChiralityState();
       }
-      // si no se superó el límite, se conserva el último vector válido
     }
 
     if (!isRecording) {
