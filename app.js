@@ -1,5 +1,15 @@
 import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
+// ---------------- Instalable como app (PWA) ----------------
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("service-worker.js").catch((error) => {
+      console.error("No se pudo registrar el service worker:", error);
+    });
+  });
+}
+
 // ---------------- Modo desarrollador ----------------
 
 const DEVELOPER_MODE_KEY = "openhands-developer-mode";
@@ -55,8 +65,8 @@ async function startCamera() {
   }
 
   try {
-    cameraStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 640 }, height: { ideal: 480 } },
+        cameraStream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false,
     });
 
@@ -245,9 +255,9 @@ async function initHandLandmarker() {
       // "desaparezca" tan seguido, sin afectar el rendimiento (estos
       // umbrales no cuestan tiempo de cómputo extra, solo cambian qué
       // tan exigente es la decisión final).
-      minHandDetectionConfidence: 0.4,
+                      minHandDetectionConfidence: 0.4,
       minHandPresenceConfidence: 0.4,
-      minTrackingConfidence: 0.35,
+      minTrackingConfidence: 0.3,
     });
 
     globalStatus.textContent = "cámara activa, esperando actividad…";
@@ -719,9 +729,8 @@ saveOfficialVocabButton.addEventListener("click", async () => {
 });
 
 // ---- Sensibilidad de reconocimiento ----
-
-const MIN_THRESHOLD = 0.12;
-const MAX_THRESHOLD = 0.55;
+const MIN_THRESHOLD = 0.08;
+const MAX_THRESHOLD = 0.7;
 
 function loadSensitivity() {
   const raw = localStorage.getItem(SENSITIVITY_STORAGE_KEY);
@@ -755,6 +764,8 @@ let lastNormalizedVector = null;
 let lastCaptureTime = 0;
 const CAPTURE_INTERVAL_MS = 100;
 
+let recordingHandCount = null; // se fija con la primera muestra buena de esta grabación
+
 function startRecordingSamples() {
   const name = gestureNameInput.value.trim().toUpperCase();
   if (!name) {
@@ -764,6 +775,7 @@ function startRecordingSamples() {
   currentGestureName = name;
   captureBuffer = [];
   lastCaptureTime = 0;
+  recordingHandCount = null;
   isRecording = true;
   recordSamplesButton.disabled = true;
 }
@@ -798,6 +810,19 @@ recordSamplesButton.addEventListener("click", () => {
 function captureSampleIfRecording() {
   if (!isRecording) return;
   if (!lastNormalizedVector) return;
+
+  // Si esta seña se está grabando como "de 2 manos" (o "de 1 mano"),
+  // se descarta silenciosamente cualquier muestra que no coincida —
+  // esto pasa típicamente en el instante exacto de un choque/contacto
+  // entre las manos, donde el detector pierde una de las dos por un
+  // fotograma. Sin este filtro, esa muestra "a medias" se guardaba
+  // igual, mezclando tamaños distintos bajo el mismo nombre de seña.
+  const currentHandCount = lastNormalizedVector.length / HAND_VECTOR_LENGTH;
+  if (recordingHandCount === null) {
+    recordingHandCount = currentHandCount;
+  } else if (currentHandCount !== recordingHandCount) {
+    return;
+  }
 
   const now = performance.now();
   if (now - lastCaptureTime < CAPTURE_INTERVAL_MS) return;
@@ -870,19 +895,28 @@ function vectorSquaredDistanceToSample(vector, sample) {
 }
 
 function classifyVector(vector) {
-  const allDistances = [];
+  // Mantiene solo los K vecinos más cercanos vistos hasta el momento,
+  // en vez de guardar TODAS las distancias y ordenarlas al final. Con
+  // vocabularios grandes (muchas señas) esto es mucho más rápido.
+  const nearest = [];
+
   for (const [name, samples] of Object.entries(vocabulary)) {
     for (const sample of samples) {
-      allDistances.push({ name, sqDistance: vectorSquaredDistanceToSample(vector, sample) });
+      const sqDistance = vectorSquaredDistanceToSample(vector, sample);
+
+      if (nearest.length < K_NEAREST) {
+        nearest.push({ name, sqDistance });
+        nearest.sort((a, b) => a.sqDistance - b.sqDistance);
+      } else if (sqDistance < nearest[nearest.length - 1].sqDistance) {
+        nearest[nearest.length - 1] = { name, sqDistance };
+        nearest.sort((a, b) => a.sqDistance - b.sqDistance);
+      }
     }
   }
 
-  if (allDistances.length === 0) {
+  if (nearest.length === 0) {
     return { name: null, distance: Infinity };
   }
-
-  allDistances.sort((a, b) => a.sqDistance - b.sqDistance);
-  const nearest = allDistances.slice(0, Math.min(K_NEAREST, allDistances.length));
 
   const votes = {};
   for (const neighbor of nearest) {
@@ -940,10 +974,21 @@ function updateRecognitionStatus(candidate, distance, threshold) {
     `(distancia ${distance.toFixed(2)}, umbral ${threshold.toFixed(2)})`;
 }
 
+// Carril rápido: si la coincidencia es MUY clara (mucho más cerca que
+// el umbral normal), se confirma casi de inmediato en vez de esperar
+// toda la ventana de 5 fotogramas. Los casos dudosos siguen pasando
+// por la ventana normal, así que no se pierde precisión.
+const FAST_CONFIRM_DISTANCE_RATIO = 0.5;
+const FAST_CONFIRM_FRAMES = 2;
+let fastConfirmCandidate = null;
+let fastConfirmStreak = 0;
+
 function processRecognition(vector) {
   if (!vector || Object.keys(vocabulary).length === 0) {
     recentCandidates = [];
     confirmedLabel = null;
+    fastConfirmCandidate = null;
+    fastConfirmStreak = 0;
     updateRecognitionStatus(null, null, null);
     return;
   }
@@ -952,6 +997,24 @@ function processRecognition(vector) {
   const threshold = getCurrentThreshold();
   const candidate = name && distance <= threshold ? name : null;
 
+  // ---- Carril rápido ----
+  if (candidate && distance <= threshold * FAST_CONFIRM_DISTANCE_RATIO) {
+    if (candidate === fastConfirmCandidate) {
+      fastConfirmStreak++;
+    } else {
+      fastConfirmCandidate = candidate;
+      fastConfirmStreak = 1;
+    }
+    if (fastConfirmStreak >= FAST_CONFIRM_FRAMES && confirmedLabel !== candidate) {
+      confirmWord(candidate);
+      confirmedLabel = candidate;
+    }
+  } else {
+    fastConfirmCandidate = null;
+    fastConfirmStreak = 0;
+  }
+
+  // ---- Ventana robusta (casos menos claros) ----
   recentCandidates.push(candidate);
   if (recentCandidates.length > CONFIRM_WINDOW_SIZE) {
     recentCandidates.shift();
@@ -973,7 +1036,7 @@ function processRecognition(vector) {
   }
 
   if (windowWinner !== confirmedLabel) {
-    confirmedLabel = null;
+    confirmedLabel = confirmedLabel; // no se reinicia aquí: el carril rápido ya pudo haberlo confirmado arriba
   }
 
   if (windowWinner && windowWinnerVotes >= CONFIRM_VOTES_NEEDED && confirmedLabel !== windowWinner) {
@@ -1293,6 +1356,35 @@ initPeer();
 let missedFrameCount = 0;
 const MAX_MISSED_FRAMES = 10;
 
+// Evita que un parpadeo de UN solo fotograma (detecta 2 manos, luego
+// 1, luego 2 de nuevo) rompa el reconocimiento de señas de dos manos.
+// Solo se acepta el cambio de "estoy viendo 1 mano" a "estoy viendo 2
+// manos" (o viceversa) si se repite 2 fotogramas seguidos.
+let lastStableHandCount = 0;
+let pendingHandCount = null;
+let handCountMismatchStreak = 0;
+const HAND_COUNT_DEBOUNCE_FRAMES = 2;
+
+function updateStableHandCount(currentCount) {
+  if (currentCount === lastStableHandCount) {
+    pendingHandCount = null;
+    handCountMismatchStreak = 0;
+    return lastStableHandCount;
+  }
+  if (currentCount === pendingHandCount) {
+    handCountMismatchStreak++;
+  } else {
+    pendingHandCount = currentCount;
+    handCountMismatchStreak = 1;
+  }
+  if (handCountMismatchStreak >= HAND_COUNT_DEBOUNCE_FRAMES) {
+    lastStableHandCount = currentCount;
+    pendingHandCount = null;
+    handCountMismatchStreak = 0;
+  }
+  return lastStableHandCount;
+}
+
 let recognitionFrameCounter = 0;
 const RECOGNITION_FRAME_INTERVAL = 2;
 
@@ -1316,18 +1408,28 @@ function predictLoop() {
     drawHands(results);
     updateLandmarksInfo(results.landmarks, results.handedness);
 
-    if (results.landmarks.length > 0) {
+        if (results.landmarks.length > 0) {
       missedFrameCount = 0;
-      const handVectors = results.landmarks
-        .slice(0, 2)
-        .map((lm, idx) => normalizeLandmarks(lm, idx));
-      lastNormalizedVector =
-        handVectors.length === 2 ? [...handVectors[0], ...handVectors[1]] : handVectors[0];
+      const rawCount = Math.min(results.landmarks.length, 2);
+      const stableCount = updateStableHandCount(rawCount);
+      const usableCount = Math.min(stableCount || rawCount, results.landmarks.length);
+
+      if (usableCount >= 2) {
+        const v0 = normalizeLandmarks(results.landmarks[0], 0);
+        const v1 = normalizeLandmarks(results.landmarks[1], 1);
+        lastNormalizedVector = [...v0, ...v1];
+      } else if (usableCount === 1) {
+        lastNormalizedVector = normalizeLandmarks(results.landmarks[0], 0);
+      }
+      // si usableCount da 0 por alguna razón rara, se conserva el vector anterior
     } else {
       missedFrameCount++;
       if (missedFrameCount > MAX_MISSED_FRAMES) {
         lastNormalizedVector = null;
         resetChiralityState();
+        lastStableHandCount = 0;
+        pendingHandCount = null;
+        handCountMismatchStreak = 0;
       }
     }
 
@@ -1344,6 +1446,26 @@ function predictLoop() {
   }
   requestAnimationFrame(predictLoop);
 }
+
+// ---------------- Escribir texto directo (oyente) ----------------
+
+const listenerTypeInput = document.getElementById("listener-type-input");
+const listenerTypeSendButton = document.getElementById("listener-type-send-button");
+
+function sendTypedListenerText() {
+  const text = listenerTypeInput.value.trim();
+  if (!text) return;
+  listenerSpeechText.textContent = text;
+  sendCallData({ type: "speech_final", text });
+  listenerTypeInput.value = "";
+}
+
+listenerTypeSendButton.addEventListener("click", sendTypedListenerText);
+listenerTypeInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    sendTypedListenerText();
+  }
+});
 
 renderVocabularyList();
 initHandLandmarker();

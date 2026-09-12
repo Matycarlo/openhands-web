@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OpenHands · Traductor LSC en vivo</title>
   <link rel="stylesheet" href="style.css" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icon.svg" />
+  <meta name="theme-color" content="#151a21" />
 </head>
 <body>
 
@@ -106,6 +110,11 @@
               Lo que la persona sorda firme y envíe aparecerá aquí como texto (y se puede leer en voz alta).
             </p>
           </div>
+        </div>
+
+        <div class="listener-type-row">
+          <input id="listener-type-input" type="text" class="text-input" placeholder="O escribe aquí en vez de hablar..." />
+          <button id="listener-type-send-button" class="btn btn-primary">Enviar</button>
         </div>
 
         <div class="listener-footer">
