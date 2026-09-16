@@ -1,5 +1,50 @@
 import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
+// =============================================================================
+// CAMBIOS DE ESTA VERSIÓN (resumen para ti):
+//
+// 1) SEGUIMIENTO DE DOS MANOS: antes se ordenaban las manos detectadas cada
+//    frame solo por su posición X. Si las manos se cruzaban, o el detector
+//    las entregaba en distinto orden interno (algo que MediaPipe puede hacer
+//    aunque ninguna mano se haya movido), la mano "A" y la mano "B" cambiaban
+//    de identidad de un frame a otro. Eso rompía tanto la normalización de
+//    espejo (guardada por índice) como el vector de dos manos, y hacía que
+//    el reconocimiento con dos manos fuera errático.
+//    Ahora cada mano detectada se asigna a una "pista" (track) persistente,
+//    eligiendo en cada frame la asignación que menos desplazamiento implica
+//    respecto al frame anterior. Así la identidad de cada mano se mantiene
+//    estable aunque se crucen o se muevan rápido.
+//
+// 2) MODO ESPEJO (normalización de lateralidad): antes se calculaba con un
+//    producto triple geométrico (chirality) que es ruidoso cuando la mano
+//    está casi de perfil o casi plana respecto a la cámara. Ahora se usa
+//    directamente la lateralidad ("Left"/"Right") que ya calcula MediaPipe
+//    por cada mano, suavizada con un pequeño voto de mayoría por pista, para
+//    evitar parpadeos si un frame suelto se clasifica mal.
+//
+// 3) RECONOCIMIENTO (confianza baja / tarda en mostrar el resultado): la
+//    inestabilidad de los dos puntos anteriores hacía que el vector de
+//    landmarks "saltara" de frame a frame, lo que produce distancias mayores
+//    (confianza baja) y evita que se acumulen suficientes votos consistentes
+//    para confirmar rápido. Se añadió:
+//      - un suavizado temporal (EMA) del vector antes de clasificar
+//        (se usa igual para grabar muestras y para reconocer en vivo),
+//      - un cálculo de confianza independiente del umbral de sensibilidad
+//        (antes, si ponías el umbral estricto, hasta una coincidencia buena
+//        se veía con confianza baja),
+//      - una confirmación "rápida" un poco más permisiva para que las señas
+//        claras se muestren casi al instante, sin sacrificar la ventana de
+//        votos para las señas más ambiguas.
+//
+// 4) CONFIRMACIÓN MÁS FÁCIL (este cambio): con una coincidencia clara (como
+//    la del ejemplo: distancia 0.22 contra un umbral de 0.70), antes hacían
+//    falta 2 fotogramas seguidos dentro del 65% del umbral para agregar la
+//    palabra — con el suavizado nuevo eso a veces tardaba en cumplirse y la
+//    palabra no aparecía aunque el estado ya mostrara la coincidencia. Ahora
+//    basta con 1 solo fotograma claro, y ese rango de "coincidencia clara"
+//    es más generoso (80% del umbral en vez de 65%).
+// =============================================================================
+
 // ---------------- Instalable como app (PWA) ----------------
 
 if ("serviceWorker" in navigator) {
@@ -9,6 +54,28 @@ if ("serviceWorker" in navigator) {
     });
   });
 }
+
+let deferredInstallPrompt = null;
+const installAppButton = document.getElementById("install-app-button");
+
+window.addEventListener("beforeinstallprompt", (event) => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  installAppButton.style.display = "";
+});
+
+installAppButton.addEventListener("click", async () => {
+  if (!deferredInstallPrompt) return;
+  deferredInstallPrompt.prompt();
+  await deferredInstallPrompt.userChoice;
+  deferredInstallPrompt = null;
+  installAppButton.style.display = "none";
+});
+
+window.addEventListener("appinstalled", () => {
+  installAppButton.style.display = "none";
+  deferredInstallPrompt = null;
+});
 
 // ---------------- Modo desarrollador ----------------
 
@@ -65,8 +132,8 @@ async function startCamera() {
   }
 
   try {
-        cameraStream = await navigator.mediaDevices.getUserMedia({
-            video: { width: { ideal: 640 }, height: { ideal: 480 } },
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false,
     });
 
@@ -105,7 +172,9 @@ function stopCamera() {
   handStatus.textContent = "sin mano detectada";
   landmarksInfo.textContent = "Sin manos detectadas — vector de landmarks no disponible.";
   handCanvasCtx.clearRect(0, 0, handCanvas.width, handCanvas.height);
-  resetChiralityState();
+  resetHandTracks();
+  lastNormalizedVector = null;
+  smoothedVectorState = null;
   missedFrameCount = 0;
 }
 
@@ -250,14 +319,13 @@ async function initHandLandmarker() {
         delegate: "GPU",
       },
       runningMode: "VIDEO",
-            numHands: 2,
-      // Balance ajustado: más permisivo que antes para que la mano no
-      // "desaparezca" tan seguido, sin afectar el rendimiento (estos
-      // umbrales no cuestan tiempo de cómputo extra, solo cambian qué
-      // tan exigente es la decisión final).
-                      minHandDetectionConfidence: 0.4,
-      minHandPresenceConfidence: 0.4,
-      minTrackingConfidence: 0.3,
+      numHands: 2,
+      // Bajados un poco respecto a la versión anterior: ayuda a que la
+      // segunda mano no se "pierda" tan fácil cuando está más lejos, más
+      // pequeña en el encuadre, o parcialmente tapada por la otra.
+      minHandDetectionConfidence: 0.25,
+      minHandPresenceConfidence: 0.12,
+      minTrackingConfidence: 0.08,
     });
 
     globalStatus.textContent = "cámara activa, esperando actividad…";
@@ -337,7 +405,7 @@ function drawHands(results) {
 
 // ---------------- Extracción y normalización de landmarks ----------------
 
-const MIN_HAND_SIZE_THRESHOLD = 0.15;
+const MIN_HAND_SIZE_THRESHOLD = 0.05;
 
 function computeHandSizeInFrame(landmarks) {
   const wrist = landmarks[0];
@@ -351,47 +419,159 @@ function computeHandSizeInFrame(landmarks) {
   return maxDistance;
 }
 
-let lastStableChiralitySigns = [null, null];
+// ---------------- Seguimiento estable de manos (pistas / tracks) ----------------
+//
+// Cada "pista" representa una mano física a lo largo del tiempo. En vez de
+// confiar en el orden en que MediaPipe entrega las manos cada frame (que
+// puede cambiar de un frame a otro), asignamos las manos detectadas a la
+// pista más cercana a su posición anterior. Esto evita que, al cruzar las
+// manos o moverlas rápido, la mano "1" y la mano "2" se intercambien.
+//
+// Además cada pista guarda un pequeño historial de lateralidad
+// ("Left"/"Right" según MediaPipe) para decidir el signo de espejo de forma
+// estable, sin que un solo frame mal clasificado lo haga parpadear.
 
-function resetChiralityState() {
-  lastStableChiralitySigns = [null, null];
+const HAND_TRACK_MAX_MISSING_FRAMES = 10;
+const MIRROR_VOTE_WINDOW = 7;
+
+function createEmptyTrack() {
+  return {
+    active: false,
+    wrist: null,
+    handednessLabel: null,
+    mirrorSign: null,
+    mirrorVotes: [],
+    missingFrames: 0,
+  };
 }
 
-function computeChiralitySign(landmarks, handIndex) {
-  const wrist = landmarks[0];
-  const indexMcp = landmarks[5];
-  const middleMcp = landmarks[9];
-  const pinkyMcp = landmarks[17];
+let handTracks = [createEmptyTrack(), createEmptyTrack()];
 
-  const v1 = { x: indexMcp.x - wrist.x, y: indexMcp.y - wrist.y, z: indexMcp.z - wrist.z };
-  const v2 = { x: middleMcp.x - wrist.x, y: middleMcp.y - wrist.y, z: middleMcp.z - wrist.z };
-  const v3 = { x: pinkyMcp.x - wrist.x, y: pinkyMcp.y - wrist.y, z: pinkyMcp.z - wrist.z };
+function resetHandTracks() {
+  handTracks = [createEmptyTrack(), createEmptyTrack()];
+}
 
-  const crossX = v2.y * v3.z - v2.z * v3.y;
-  const crossY = v2.z * v3.x - v2.x * v3.z;
-  const crossZ = v2.x * v3.y - v2.y * v3.x;
+function distanceBetweenPoints(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
 
-  const tripleProduct = v1.x * crossX + v1.y * crossY + v1.z * crossZ;
-  const currentSign = tripleProduct >= 0 ? 1 : -1;
+function pushMirrorVote(track, label) {
+  const safeLabel = label || track.handednessLabel || "Right";
+  track.mirrorVotes.push(safeLabel);
+  if (track.mirrorVotes.length > MIRROR_VOTE_WINDOW) track.mirrorVotes.shift();
 
-  const CHIRALITY_CONFIDENCE_THRESHOLD = 0.0004;
+  const tally = {};
+  for (const l of track.mirrorVotes) tally[l] = (tally[l] || 0) + 1;
+  let bestLabel = safeLabel;
+  let bestCount = -1;
+  for (const [l, c] of Object.entries(tally)) {
+    if (c > bestCount) {
+      bestCount = c;
+      bestLabel = l;
+    }
+  }
+  track.handednessLabel = bestLabel;
+  track.mirrorSign = bestLabel === "Left" ? 1 : -1;
+}
 
-  if (
-    lastStableChiralitySigns[handIndex] === null ||
-    Math.abs(tripleProduct) > CHIRALITY_CONFIDENCE_THRESHOLD
-  ) {
-    lastStableChiralitySigns[handIndex] = currentSign;
+function updateTrackFromHand(track, landmarks, handednessLabel) {
+  track.active = true;
+  track.wrist = { x: landmarks[0].x, y: landmarks[0].y };
+  track.missingFrames = 0;
+  pushMirrorVote(track, handednessLabel);
+}
+
+function markTrackMissing(track) {
+  if (!track.active) return;
+  track.missingFrames++;
+  if (track.missingFrames > HAND_TRACK_MAX_MISSING_FRAMES) {
+    track.active = false;
+    track.wrist = null;
+    track.handednessLabel = null;
+    track.mirrorSign = null;
+    track.mirrorVotes = [];
+    track.missingFrames = 0;
+  }
+}
+
+// Devuelve un arreglo de longitud 2 alineado con handTracks: en cada
+// posición, o bien { landmarks, track } si a esa pista le tocó una mano
+// este frame, o null si esa pista no tiene mano este frame.
+function assignHandsToTracks(handsLandmarks, handednessList) {
+  const numHands = handsLandmarks.length;
+  const assignment = [null, null];
+
+  if (numHands === 0) {
+    markTrackMissing(handTracks[0]);
+    markTrackMissing(handTracks[1]);
+    return assignment;
   }
 
-  return lastStableChiralitySigns[handIndex];
+  const labels = handsLandmarks.map((_, i) => {
+    const h = handednessList && handednessList[i] && handednessList[i][0];
+    return h ? h.categoryName : null;
+  });
+
+  if (numHands === 1) {
+    const wrist = handsLandmarks[0][0];
+    let targetIndex = 0;
+
+    if (handTracks[0].active && handTracks[1].active) {
+      const d0 = distanceBetweenPoints(wrist, handTracks[0].wrist);
+      const d1 = distanceBetweenPoints(wrist, handTracks[1].wrist);
+      targetIndex = d0 <= d1 ? 0 : 1;
+    } else if (handTracks[1].active && !handTracks[0].active) {
+      targetIndex = 1;
+    } else {
+      targetIndex = 0;
+    }
+
+    updateTrackFromHand(handTracks[targetIndex], handsLandmarks[0], labels[0]);
+    assignment[targetIndex] = { landmarks: handsLandmarks[0], track: handTracks[targetIndex] };
+    markTrackMissing(handTracks[1 - targetIndex]);
+    return assignment;
+  }
+
+  // Dos (o más, ya limitado a las dos primeras) manos detectadas.
+  const handA = handsLandmarks[0];
+  const handB = handsLandmarks[1];
+  const labelA = labels[0];
+  const labelB = labels[1];
+
+  if (handTracks[0].active || handTracks[1].active) {
+    // Probar las dos asignaciones posibles y quedarnos con la que menos
+    // desplazamiento total implica respecto al frame anterior.
+    const costNormal =
+      (handTracks[0].active ? distanceBetweenPoints(handA[0], handTracks[0].wrist) : 0) +
+      (handTracks[1].active ? distanceBetweenPoints(handB[0], handTracks[1].wrist) : 0);
+    const costSwapped =
+      (handTracks[0].active ? distanceBetweenPoints(handB[0], handTracks[0].wrist) : 0) +
+      (handTracks[1].active ? distanceBetweenPoints(handA[0], handTracks[1].wrist) : 0);
+
+    if (costSwapped < costNormal) {
+      updateTrackFromHand(handTracks[0], handB, labelB);
+      updateTrackFromHand(handTracks[1], handA, labelA);
+      assignment[0] = { landmarks: handB, track: handTracks[0] };
+      assignment[1] = { landmarks: handA, track: handTracks[1] };
+      return assignment;
+    }
+  }
+
+  updateTrackFromHand(handTracks[0], handA, labelA);
+  updateTrackFromHand(handTracks[1], handB, labelB);
+  assignment[0] = { landmarks: handA, track: handTracks[0] };
+  assignment[1] = { landmarks: handB, track: handTracks[1] };
+  return assignment;
 }
 
-function normalizeLandmarks(landmarks, handIndex = 0) {
+function normalizeLandmarks(landmarks, mirrorSign) {
   const wrist = landmarks[0];
-  const mirror = computeChiralitySign(landmarks, handIndex);
+  const sign = mirrorSign || 1;
 
   const translated = landmarks.map((p) => ({
-    x: (p.x - wrist.x) * mirror,
+    x: (p.x - wrist.x) * sign,
     y: p.y - wrist.y,
     z: p.z - wrist.z,
   }));
@@ -410,17 +590,54 @@ function normalizeLandmarks(landmarks, handIndex = 0) {
   return normalized;
 }
 
-function updateLandmarksInfo(hands, handednessList) {
-  if (!hands || hands.length === 0) {
+function computeRelativeHandPosition(landmarksA, landmarksB, mirrorA) {
+  const wristA = landmarksA[0];
+  const wristB = landmarksB[0];
+  const sizeA = computeHandSizeInFrame(landmarksA);
+  const sizeB = computeHandSizeInFrame(landmarksB);
+  const combinedScale = (sizeA + sizeB) / 2 || 1e-6;
+  const sign = mirrorA || 1;
+
+  return [
+    ((wristB.x - wristA.x) * sign) / combinedScale,
+    (wristB.y - wristA.y) / combinedScale,
+    (wristB.z - wristA.z) / combinedScale,
+  ];
+}
+
+// ---------------- Suavizado temporal del vector de landmarks ----------------
+//
+// El detector siempre tiene algo de temblor frame a frame. Sin suavizar,
+// ese temblor se traduce directamente en distancias más grandes al comparar
+// contra las muestras guardadas (menos confianza) y en que el candidato
+// reconocido cambie de un frame a otro (tarda más en confirmarse).
+// Aplicamos un suavizado exponencial (EMA) ligero — con muy poco retraso
+// perceptible — y lo usamos tanto al grabar muestras nuevas como al
+// reconocer en vivo, para comparar siempre "manzanas con manzanas".
+const SMOOTHING_ALPHA = 0.55; // 0 = sin suavizar, 1 = congelado del todo
+let smoothedVectorState = null;
+
+function smoothVector(vector) {
+  if (!smoothedVectorState || smoothedVectorState.length !== vector.length) {
+    smoothedVectorState = vector.slice();
+    return smoothedVectorState.slice();
+  }
+  const result = new Array(vector.length);
+  for (let i = 0; i < vector.length; i++) {
+    result[i] = smoothedVectorState[i] * SMOOTHING_ALPHA + vector[i] * (1 - SMOOTHING_ALPHA);
+  }
+  smoothedVectorState = result;
+  return result.slice();
+}
+
+function updateLandmarksInfo(vector, handednessLabel) {
+  if (!vector) {
     landmarksInfo.textContent = "Sin manos detectadas — vector de landmarks no disponible.";
     return;
   }
 
-  const label =
-    handednessList && handednessList[0] && handednessList[0][0]
-      ? handednessList[0][0].categoryName
-      : "Desconocida";
-  const vector = normalizeLandmarks(hands[0]);
+  const labelEs =
+    handednessLabel === "Left" ? "izquierda" : handednessLabel === "Right" ? "derecha" : "desconocida";
 
   const fingertipIndex = 8;
   const fx = vector[fingertipIndex * 3 + 0];
@@ -428,7 +645,7 @@ function updateLandmarksInfo(hands, handednessList) {
   const fz = vector[fingertipIndex * 3 + 2];
 
   landmarksInfo.textContent =
-    `Mano 1 (MediaPipe dice: ${label}) — vector normalizado: ${vector.length} valores | ` +
+    `Mano detectada (lateralidad: ${labelEs}) — vector normalizado: ${vector.length} valores | ` +
     `punta índice (p8): x=${fx.toFixed(2)}, y=${fy.toFixed(2)}, z=${fz.toFixed(2)}`;
 }
 
@@ -463,10 +680,9 @@ function randomRotationMatrix(maxDegrees) {
   return multiply(multiply(rotZ, rotY), rotX);
 }
 
-function applyRotation(vector, matrix) {
+function applyRotation(vector, matrix, numPointsToRotate) {
   const rotated = [];
-  const numPoints = vector.length / 3;
-  for (let i = 0; i < numPoints; i++) {
+  for (let i = 0; i < numPointsToRotate; i++) {
     const x = vector[i * 3 + 0];
     const y = vector[i * 3 + 1];
     const z = vector[i * 3 + 2];
@@ -476,18 +692,25 @@ function applyRotation(vector, matrix) {
       matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z
     );
   }
+  for (let i = numPointsToRotate * 3; i < vector.length; i++) {
+    rotated.push(vector[i]);
+  }
   return rotated;
 }
 
-const AUGMENTATION_COPIES = 4;
-const AUGMENTATION_MAX_DEGREES = 25;
+const AUGMENTATION_COPIES = 6;
+// Subido de 25 a 30 grados: más tolerancia a poses ligeramente
+// distintas de como se grabó originalmente (lo que pediste como
+// "reconocer poses más raras").
+const AUGMENTATION_MAX_DEGREES = 30;
 const AUGMENTATION_NOISE_STD = 0.015;
 
 function augmentSample(vector) {
   const augmented = [];
+  const numHandPoints = Math.min(Math.floor(vector.length / 3), 42);
   for (let c = 0; c < AUGMENTATION_COPIES; c++) {
     const matrix = randomRotationMatrix(AUGMENTATION_MAX_DEGREES);
-    const rotated = applyRotation(vector, matrix);
+    const rotated = applyRotation(vector, matrix, numHandPoints);
     const noisy = rotated.map((v) => v + (Math.random() * 2 - 1) * AUGMENTATION_NOISE_STD);
     augmented.push(noisy);
   }
@@ -500,6 +723,7 @@ const trainingPanel = document.getElementById("training-panel");
 const closeTrainingPanelButton = document.getElementById("close-training-panel");
 const gestureNameInput = document.getElementById("gesture-name-input");
 const recordSamplesButton = document.getElementById("record-samples-button");
+const cancelRecordingButton = document.getElementById("cancel-recording-button");
 const vocabularyList = document.getElementById("vocabulary-list");
 const sensitivitySlider = document.getElementById("sensitivity-slider");
 const sensitivityValueReadout = document.getElementById("sensitivity-value-readout");
@@ -522,6 +746,7 @@ document.querySelectorAll(".chip-button").forEach((button) => {
 
 const VOCAB_STORAGE_KEY = "openhands-vocabulary";
 const SENSITIVITY_STORAGE_KEY = "openhands-sensitivity";
+const THUMBNAIL_STORAGE_KEY = "openhands-thumbnails";
 
 function loadVocabulary() {
   try {
@@ -537,7 +762,38 @@ function saveVocabulary() {
   localStorage.setItem(VOCAB_STORAGE_KEY, JSON.stringify(vocabulary));
 }
 
+function loadThumbnails() {
+  try {
+    const raw = localStorage.getItem(THUMBNAIL_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (error) {
+    return {};
+  }
+}
+
+function saveThumbnails() {
+  localStorage.setItem(THUMBNAIL_STORAGE_KEY, JSON.stringify(thumbnails));
+}
+
 let vocabulary = loadVocabulary();
+let thumbnails = loadThumbnails();
+
+function captureThumbnail() {
+  const THUMB_WIDTH = 120;
+  const THUMB_HEIGHT = 90;
+  const offscreen = document.createElement("canvas");
+  offscreen.width = THUMB_WIDTH;
+  offscreen.height = THUMB_HEIGHT;
+  const ctx = offscreen.getContext("2d");
+  ctx.translate(THUMB_WIDTH, 0);
+  ctx.scale(-1, 1);
+  try {
+    ctx.drawImage(cameraPreview, 0, 0, THUMB_WIDTH, THUMB_HEIGHT);
+    return offscreen.toDataURL("image/jpeg", 0.6);
+  } catch (error) {
+    return null;
+  }
+}
 
 function addSamplesToVocabulary(name, samples) {
   if (!vocabulary[name]) {
@@ -549,7 +805,9 @@ function addSamplesToVocabulary(name, samples) {
 
 function deleteGesture(name) {
   delete vocabulary[name];
+  delete thumbnails[name];
   saveVocabulary();
+  saveThumbnails();
   renderVocabularyList();
 }
 
@@ -564,9 +822,15 @@ function renderVocabularyList() {
 
   for (const name of names) {
     const count = vocabulary[name].length;
+    const thumbnailSrc = thumbnails[name];
     const row = document.createElement("div");
     row.className = "vocab-row";
     row.innerHTML = `
+      ${
+        thumbnailSrc
+          ? `<img class="vocab-thumbnail" src="${thumbnailSrc}" alt="${name}" />`
+          : `<span class="vocab-thumbnail vocab-thumbnail-empty"></span>`
+      }
       <span class="vocab-name">${name}</span>
       <span class="vocab-count">${count} muestras</span>
       <button class="vocab-delete" data-name="${name}">eliminar</button>
@@ -688,33 +952,13 @@ importOfficialVocabButton.addEventListener("click", async () => {
 
 const saveOfficialVocabButton = document.getElementById("save-official-vocab-button");
 
-saveOfficialVocabButton.addEventListener("click", async () => {
+saveOfficialVocabButton.addEventListener("click", () => {
   if (Object.keys(vocabulary).length === 0) {
     alert("No hay ningún vocabulario entrenado todavía para guardar.");
     return;
   }
 
   const jsonText = JSON.stringify(vocabulary, null, 2);
-
-  if (window.showSaveFilePicker) {
-    try {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: "default-vocabulary.json",
-        types: [{ description: "Archivo JSON", accept: { "application/json": [".json"] } }],
-      });
-      const writable = await handle.createWritable();
-      await writable.write(jsonText);
-      await writable.close();
-      alert(
-        "Archivo guardado. Ahora en la terminal ejecuta:\n\n" +
-        "git add .\ngit commit -m \"Actualizar vocabulario\"\ngit push"
-      );
-      return;
-    } catch (error) {
-      if (error.name === "AbortError") return;
-      console.error("No se pudo guardar directamente:", error);
-    }
-  }
 
   const blob = new Blob([jsonText], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -725,10 +969,15 @@ saveOfficialVocabButton.addEventListener("click", async () => {
   link.click();
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
-  alert("Se descargó a tu carpeta de Descargas. Muévelo a la carpeta del proyecto (ya con el nombre correcto).");
+  alert(
+    "Se descargó a tu carpeta de Descargas como default-vocabulary.json. " +
+    "Muévelo a la carpeta del proyecto y luego en la terminal ejecuta:\n\n" +
+    "git add .\ngit commit -m \"Actualizar vocabulario\"\ngit push"
+  );
 });
 
 // ---- Sensibilidad de reconocimiento ----
+
 const MIN_THRESHOLD = 0.08;
 const MAX_THRESHOLD = 0.7;
 
@@ -755,7 +1004,9 @@ sensitivitySlider.addEventListener("input", () => {
 
 // ---- Captura de muestras ----
 
-const SAMPLES_PER_RECORDING = 15;
+const SAMPLES_PER_RECORDING = 25;
+const MIN_CONSISTENT_SAMPLES = 3;
+const RECORDING_TIMEOUT_MS = 8000;
 
 let isRecording = false;
 let captureBuffer = [];
@@ -763,8 +1014,8 @@ let currentGestureName = "";
 let lastNormalizedVector = null;
 let lastCaptureTime = 0;
 const CAPTURE_INTERVAL_MS = 100;
-
-let recordingHandCount = null; // se fija con la primera muestra buena de esta grabación
+let recordingTimeoutId = null;
+let recordingHandCountLog = [];
 
 function startRecordingSamples() {
   const name = gestureNameInput.value.trim().toUpperCase();
@@ -775,30 +1026,123 @@ function startRecordingSamples() {
   currentGestureName = name;
   captureBuffer = [];
   lastCaptureTime = 0;
-  recordingHandCount = null;
+  recordingHandCountLog = [];
   isRecording = true;
   recordSamplesButton.disabled = true;
+  cancelRecordingButton.style.display = "";
+
+  clearTimeout(recordingTimeoutId);
+  recordingTimeoutId = setTimeout(() => {
+    if (isRecording) {
+      abortRecording("Se agotó el tiempo (8 segundos) sin completar la grabación.");
+    }
+  }, RECORDING_TIMEOUT_MS);
+}
+
+function describeHandCountLog() {
+  const tally = {};
+  for (const count of recordingHandCountLog) {
+    const key = count === null ? "sin mano" : `${count} mano(s)`;
+    tally[key] = (tally[key] || 0) + 1;
+  }
+  return Object.entries(tally)
+    .map(([label, n]) => `${label}: ${n}`)
+    .join(", ");
+}
+
+function abortRecording(reasonMessage) {
+  isRecording = false;
+  clearTimeout(recordingTimeoutId);
+  recordSamplesButton.disabled = false;
+  recordSamplesButton.innerHTML = '<span class="record-dot"></span> Grabar 25 muestras';
+  cancelRecordingButton.style.display = "none";
+
+  const detail = describeHandCountLog();
+  alert(
+    `${reasonMessage}\n\n` +
+    `Se capturaron ${captureBuffer.length} fotogramas antes de detenerse.\n` +
+    (detail ? `Detalle de lo detectado: ${detail}.\n\n` : "\n") +
+    "Intenta de nuevo con mejor luz y mostrando bien la(s) mano(s), sin que se toquen entre sí."
+  );
+
+  captureBuffer = [];
+}
+
+cancelRecordingButton.addEventListener("click", () => {
+  abortRecording("Grabación cancelada manualmente.");
+});
+
+function getSampleHandCount(sample) {
+  if (sample.length === HAND_VECTOR_LENGTH) return 1;
+  if (sample.length === TWO_HAND_VECTOR_LENGTH) return 2;
+  return null;
 }
 
 function finishRecordingSamples(success) {
   isRecording = false;
+  clearTimeout(recordingTimeoutId);
   recordSamplesButton.disabled = false;
-  recordSamplesButton.innerHTML = '<span class="record-dot"></span> Grabar 15 muestras';
+  recordSamplesButton.innerHTML = '<span class="record-dot"></span> Grabar 25 muestras';
+  cancelRecordingButton.style.display = "none";
 
-  if (!success) {
+  if (!success || captureBuffer.length === 0) {
     alert("No se detectó la mano lo suficiente. Intenta de nuevo mostrando bien la mano.");
     captureBuffer = [];
     return;
   }
 
-  const expandedBuffer = [];
+  const countTally = {};
   for (const sample of captureBuffer) {
+    const count = getSampleHandCount(sample);
+    countTally[count] = (countTally[count] || 0) + 1;
+  }
+  let majorityCount = null;
+  let majorityVotes = -1;
+  for (const [count, votes] of Object.entries(countTally)) {
+    if (votes > majorityVotes) {
+      majorityVotes = votes;
+      majorityCount = Number(count);
+    }
+  }
+
+  const consistentSamples = captureBuffer.filter(
+    (sample) => getSampleHandCount(sample) === majorityCount
+  );
+  const totalCaptured = captureBuffer.length;
+  captureBuffer = [];
+
+  if (consistentSamples.length < MIN_CONSISTENT_SAMPLES) {
+    alert(
+      `Solo se lograron ${consistentSamples.length} muestras consistentes de ` +
+      `${totalCaptured} capturadas (se necesitan al menos ${MIN_CONSISTENT_SAMPLES}). ` +
+      "Intenta de nuevo separando un poco más las manos entre sí, sin que se toquen " +
+      "ni se tapen, y mostrando bien ambas a la cámara."
+    );
+    return;
+  }
+
+  const expandedBuffer = [];
+  for (const sample of consistentSamples) {
     expandedBuffer.push(sample, ...augmentSample(sample));
   }
 
   addSamplesToVocabulary(currentGestureName, expandedBuffer);
-  captureBuffer = [];
+
+  const thumbnail = captureThumbnail();
+  if (thumbnail) {
+    thumbnails[currentGestureName] = thumbnail;
+    saveThumbnails();
+  }
+
   renderVocabularyList();
+
+  if (consistentSamples.length < totalCaptured) {
+    const discarded = totalCaptured - consistentSamples.length;
+    console.warn(
+      `${discarded} de ${totalCaptured} fotogramas se descartaron por no coincidir ` +
+      `con el conteo de manos mayoritario (${majorityCount}).`
+    );
+  }
 }
 
 recordSamplesButton.addEventListener("click", () => {
@@ -809,24 +1153,18 @@ recordSamplesButton.addEventListener("click", () => {
 
 function captureSampleIfRecording() {
   if (!isRecording) return;
-  if (!lastNormalizedVector) return;
-
-  // Si esta seña se está grabando como "de 2 manos" (o "de 1 mano"),
-  // se descarta silenciosamente cualquier muestra que no coincida —
-  // esto pasa típicamente en el instante exacto de un choque/contacto
-  // entre las manos, donde el detector pierde una de las dos por un
-  // fotograma. Sin este filtro, esa muestra "a medias" se guardaba
-  // igual, mezclando tamaños distintos bajo el mismo nombre de seña.
-  const currentHandCount = lastNormalizedVector.length / HAND_VECTOR_LENGTH;
-  if (recordingHandCount === null) {
-    recordingHandCount = currentHandCount;
-  } else if (currentHandCount !== recordingHandCount) {
-    return;
-  }
 
   const now = performance.now();
   if (now - lastCaptureTime < CAPTURE_INTERVAL_MS) return;
   lastCaptureTime = now;
+
+  if (!lastNormalizedVector) {
+    recordingHandCountLog.push(null);
+    return;
+  }
+
+  const handCount = getSampleHandCount(lastNormalizedVector);
+  recordingHandCountLog.push(handCount);
 
   captureBuffer.push(lastNormalizedVector);
   recordSamplesButton.textContent = `Grabando... ${captureBuffer.length}/${SAMPLES_PER_RECORDING}`;
@@ -854,18 +1192,16 @@ const DEFAULT_LISTENER_SPEECH_TEXT = "Aquí aparecerá, en grande, lo que diga l
 let phraseWords = [];
 let confirmedLabel = null;
 
-// Ventana de confirmación: en vez de exigir 8 fotogramas SEGUIDOS
-// idénticos (lo cual fallaba apenas había un parpadeo del detector, y
-// entonces "coincide con X" se veía en el texto de depuración pero la
-// palabra nunca se confirmaba), ahora se guarda un historial de las
-// últimas 8 predicciones y se confirma por MAYORÍA (al menos 5 de 8),
-// tolerando hasta 3 fallos puntuales sin reiniciar todo el conteo.
 const CONFIRM_WINDOW_SIZE = 5;
 const CONFIRM_VOTES_NEEDED = 3;
 let recentCandidates = [];
 
-const K_NEAREST = 7;
+// Subido de 7 a 9 vecinos: votación un poco más estable a medida que
+// crece el vocabulario.
+const K_NEAREST = 9;
 const HAND_VECTOR_LENGTH = 63;
+const RELATIVE_POSITION_LENGTH = 3;
+const TWO_HAND_VECTOR_LENGTH = HAND_VECTOR_LENGTH * 2 + RELATIVE_POSITION_LENGTH;
 
 function squaredDistance(a, b) {
   let sum = 0;
@@ -879,25 +1215,24 @@ function squaredDistance(a, b) {
 function vectorSquaredDistanceToSample(vector, sample) {
   if (vector.length !== sample.length) return Infinity;
 
-  const numHandsInVector = vector.length / HAND_VECTOR_LENGTH;
+  if (vector.length === TWO_HAND_VECTOR_LENGTH) {
+    const handA = vector.slice(0, HAND_VECTOR_LENGTH);
+    const handB = vector.slice(HAND_VECTOR_LENGTH, HAND_VECTOR_LENGTH * 2);
+    const relPos = vector.slice(HAND_VECTOR_LENGTH * 2);
 
-  if (numHandsInVector === 2) {
     const direct = squaredDistance(vector, sample);
-    const swappedVector = [
-      ...vector.slice(HAND_VECTOR_LENGTH),
-      ...vector.slice(0, HAND_VECTOR_LENGTH),
-    ];
+
+    const swappedRelPos = relPos.map((v) => -v);
+    const swappedVector = [...handB, ...handA, ...swappedRelPos];
     const swapped = squaredDistance(swappedVector, sample);
-    return Math.min(direct, swapped) / numHandsInVector;
+
+    return Math.min(direct, swapped) / 2;
   }
 
   return squaredDistance(vector, sample);
 }
 
 function classifyVector(vector) {
-  // Mantiene solo los K vecinos más cercanos vistos hasta el momento,
-  // en vez de guardar TODAS las distancias y ordenarlas al final. Con
-  // vocabularios grandes (muchas señas) esto es mucho más rápido.
   const nearest = [];
 
   for (const [name, samples] of Object.entries(vocabulary)) {
@@ -955,6 +1290,14 @@ function renderPhrase() {
   }
 }
 
+// Distancia de referencia para calcular el porcentaje de confianza. Antes
+// se usaba el mismo umbral configurable de sensibilidad para esto, lo que
+// hacía que la confianza mostrada dependiera de dónde tuvieras puesto el
+// slider (con el umbral estricto, hasta una coincidencia buena se veía con
+// confianza baja, tipo 35%). Ahora es un valor fijo, así el % refleja la
+// calidad real de la coincidencia sin importar tu sensibilidad configurada.
+const CONFIDENCE_REFERENCE_DISTANCE = 0.6;
+
 function updateRecognitionStatus(candidate, distance, threshold) {
   const totalGestures = Object.keys(vocabulary).length;
 
@@ -968,18 +1311,32 @@ function updateRecognitionStatus(candidate, distance, threshold) {
     return;
   }
 
-  const state = candidate ? `coincide con "${candidate}"` : "no coincide con ninguna seña conocida";
+  if (!candidate) {
+    recognitionStatus.textContent =
+      `Comparando con ${totalGestures} seña(s) — no coincide con ninguna seña conocida ` +
+      `(distancia ${distance.toFixed(2)}, umbral ${threshold.toFixed(2)})`;
+    return;
+  }
+
+  const confidencePercent =
+    Math.max(0, Math.min(1, 1 - distance / CONFIDENCE_REFERENCE_DISTANCE)) * 100;
   recognitionStatus.textContent =
-    `Comparando con ${totalGestures} seña(s) — ${state} ` +
-    `(distancia ${distance.toFixed(2)}, umbral ${threshold.toFixed(2)})`;
+    `Comparando con ${totalGestures} seña(s) — coincide con "${candidate}" ` +
+    `(confianza ${confidencePercent.toFixed(0)}%, distancia ${distance.toFixed(2)}, umbral ${threshold.toFixed(2)})`;
 }
 
-// Carril rápido: si la coincidencia es MUY clara (mucho más cerca que
-// el umbral normal), se confirma casi de inmediato en vez de esperar
-// toda la ventana de 5 fotogramas. Los casos dudosos siguen pasando
-// por la ventana normal, así que no se pierde precisión.
-const FAST_CONFIRM_DISTANCE_RATIO = 0.5;
-const FAST_CONFIRM_FRAMES = 2;
+// El "fast confirm" muestra la palabra casi al instante cuando la
+// coincidencia es muy clara, sin esperar a la ventana de votos de abajo.
+//
+// CAMBIO PEDIDO: antes hacían falta 2 fotogramas seguidos dentro del 65%
+// del umbral — con una coincidencia tan clara como distancia 0.22 contra
+// umbral 0.70 (32% del umbral) eso debería cumplirse casi siempre, pero
+// con el suavizado del vector a veces la distancia oscila un poco fotograma
+// a fotograma y no siempre se lograban los 2 seguidos. Ahora basta con 1
+// solo fotograma dentro de un rango más generoso (80% del umbral), así una
+// coincidencia clara se confirma de inmediato.
+const FAST_CONFIRM_DISTANCE_RATIO = 0.8;
+const FAST_CONFIRM_FRAMES = 1;
 let fastConfirmCandidate = null;
 let fastConfirmStreak = 0;
 
@@ -997,7 +1354,6 @@ function processRecognition(vector) {
   const threshold = getCurrentThreshold();
   const candidate = name && distance <= threshold ? name : null;
 
-  // ---- Carril rápido ----
   if (candidate && distance <= threshold * FAST_CONFIRM_DISTANCE_RATIO) {
     if (candidate === fastConfirmCandidate) {
       fastConfirmStreak++;
@@ -1014,7 +1370,6 @@ function processRecognition(vector) {
     fastConfirmStreak = 0;
   }
 
-  // ---- Ventana robusta (casos menos claros) ----
   recentCandidates.push(candidate);
   if (recentCandidates.length > CONFIRM_WINDOW_SIZE) {
     recentCandidates.shift();
@@ -1033,10 +1388,6 @@ function processRecognition(vector) {
       windowWinnerVotes = count;
       windowWinner = name2;
     }
-  }
-
-  if (windowWinner !== confirmedLabel) {
-    confirmedLabel = confirmedLabel; // no se reinicia aquí: el carril rápido ya pudo haberlo confirmado arriba
   }
 
   if (windowWinner && windowWinnerVotes >= CONFIRM_VOTES_NEEDED && confirmedLabel !== windowWinner) {
@@ -1348,45 +1699,11 @@ initPeer();
 
 // ---------------- Bucle principal ----------------
 
-// Tolerancia subida de 6 a 10: cubre tanto "la mano se tapó un instante
-// con la otra mano" (habitual en señas de dos manos) como "se tapó con
-// otra cosa" — no hay forma técnica de distinguir la causa exacta, así
-// que se trata igual, priorizando no perder el reconocimiento a mitad
-// de una seña de dos manos.
 let missedFrameCount = 0;
-const MAX_MISSED_FRAMES = 10;
-
-// Evita que un parpadeo de UN solo fotograma (detecta 2 manos, luego
-// 1, luego 2 de nuevo) rompa el reconocimiento de señas de dos manos.
-// Solo se acepta el cambio de "estoy viendo 1 mano" a "estoy viendo 2
-// manos" (o viceversa) si se repite 2 fotogramas seguidos.
-let lastStableHandCount = 0;
-let pendingHandCount = null;
-let handCountMismatchStreak = 0;
-const HAND_COUNT_DEBOUNCE_FRAMES = 2;
-
-function updateStableHandCount(currentCount) {
-  if (currentCount === lastStableHandCount) {
-    pendingHandCount = null;
-    handCountMismatchStreak = 0;
-    return lastStableHandCount;
-  }
-  if (currentCount === pendingHandCount) {
-    handCountMismatchStreak++;
-  } else {
-    pendingHandCount = currentCount;
-    handCountMismatchStreak = 1;
-  }
-  if (handCountMismatchStreak >= HAND_COUNT_DEBOUNCE_FRAMES) {
-    lastStableHandCount = currentCount;
-    pendingHandCount = null;
-    handCountMismatchStreak = 0;
-  }
-  return lastStableHandCount;
-}
+const MAX_MISSED_FRAMES = 15;
 
 let recognitionFrameCounter = 0;
-const RECOGNITION_FRAME_INTERVAL = 2;
+const RECOGNITION_FRAME_INTERVAL = 1;
 
 function predictLoop() {
   if (cameraStream && handLandmarker && cameraPreview.readyState >= 2) {
@@ -1406,30 +1723,39 @@ function predictLoop() {
     };
 
     drawHands(results);
-    updateLandmarksInfo(results.landmarks, results.handedness);
 
-        if (results.landmarks.length > 0) {
+    if (results.landmarks.length > 0) {
       missedFrameCount = 0;
-      const rawCount = Math.min(results.landmarks.length, 2);
-      const stableCount = updateStableHandCount(rawCount);
-      const usableCount = Math.min(stableCount || rawCount, results.landmarks.length);
 
-      if (usableCount >= 2) {
-        const v0 = normalizeLandmarks(results.landmarks[0], 0);
-        const v1 = normalizeLandmarks(results.landmarks[1], 1);
-        lastNormalizedVector = [...v0, ...v1];
-      } else if (usableCount === 1) {
-        lastNormalizedVector = normalizeLandmarks(results.landmarks[0], 0);
+      // Asignamos cada mano detectada a su pista persistente (ver sección
+      // "Seguimiento estable de manos" más arriba) en vez de confiar en el
+      // orden crudo que entrega el detector.
+      const assignment = assignHandsToTracks(results.landmarks, results.handedness);
+      const slotA = assignment[0];
+      const slotB = assignment[1];
+
+      if (slotA && slotB) {
+        const v0 = normalizeLandmarks(slotA.landmarks, slotA.track.mirrorSign);
+        const v1 = normalizeLandmarks(slotB.landmarks, slotB.track.mirrorSign);
+        const relPos = computeRelativeHandPosition(slotA.landmarks, slotB.landmarks, slotA.track.mirrorSign);
+        lastNormalizedVector = smoothVector([...v0, ...v1, ...relPos]);
+        updateLandmarksInfo(lastNormalizedVector, slotA.track.handednessLabel);
+      } else if (slotA || slotB) {
+        const only = slotA || slotB;
+        lastNormalizedVector = smoothVector(normalizeLandmarks(only.landmarks, only.track.mirrorSign));
+        updateLandmarksInfo(lastNormalizedVector, only.track.handednessLabel);
+      } else {
+        lastNormalizedVector = null;
+        smoothedVectorState = null;
+        updateLandmarksInfo(null, null);
       }
-      // si usableCount da 0 por alguna razón rara, se conserva el vector anterior
     } else {
       missedFrameCount++;
       if (missedFrameCount > MAX_MISSED_FRAMES) {
         lastNormalizedVector = null;
-        resetChiralityState();
-        lastStableHandCount = 0;
-        pendingHandCount = null;
-        handCountMismatchStreak = 0;
+        smoothedVectorState = null;
+        resetHandTracks();
+        updateLandmarksInfo(null, null);
       }
     }
 
