@@ -24,6 +24,9 @@
       </div>
 
       <div class="header-actions">
+        <button id="install-app-button" class="btn btn-primary" style="display: none;">
+          ⬇️ Instalar app
+        </button>
         <button id="import-official-vocab-button" class="btn btn-outline">
           📥 Cargar señas
         </button>
@@ -66,6 +69,13 @@
             </p>
           </div>
         </div>
+
+        <p id="camera-tips" class="camera-tips">
+           Para que la cámara te reconozca mejor: mantén una distancia de
+          medio brazo aprox. de la cámara, procura buena luz de frente (evita
+          quedar a contraluz), muestra la mano completa dentro del recuadro y
+          haz la seña de forma clara y sin prisa.
+        </p>
 
         <div class="recognized-row">
           <div id="recognized-words" class="recognized-words">
@@ -149,6 +159,14 @@
           <button class="chip-button" data-word="AGUA">AGUA</button>
         </div>
 
+        <p class="training-hint training-hint-tips">
+          🎥 Consejo para grabar mejor: quédate a una distancia cómoda (ni muy
+          pegado ni muy lejos de la cámara), con buena luz de frente, y repite
+          la grabación de la misma seña 2-3 veces variando un poco el ángulo
+          de la mano y tu posición frente a la cámara. Eso ayuda mucho más
+          que grabar muchas veces desde el mismo lugar exacto.
+        </p>
+
         <h3 class="training-subtitle">Sensibilidad de reconocimiento</h3>
         <div class="sensitivity-row">
           <span class="sensitivity-label">estricto</span>
@@ -158,7 +176,10 @@
         <p id="sensitivity-value-readout" class="training-hint">Umbral actual: 0.30</p>
 
         <button id="record-samples-button" class="btn btn-primary btn-block">
-          <span class="record-dot"></span> Grabar 15 muestras
+          <span class="record-dot"></span> Grabar 25 muestras
+        </button>
+        <button id="cancel-recording-button" class="btn btn-outline btn-block" style="display: none;">
+          Cancelar grabación
         </button>
 
         <p class="training-hint">

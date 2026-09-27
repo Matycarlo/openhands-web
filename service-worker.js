@@ -1,4 +1,7 @@
-const CACHE_NAME = "openhands-cache-v1";
+// v2: cada vez que cambien los archivos de forma importante, sube este
+// número (v3, v4...). Eso obliga al navegador a descartar la copia
+// vieja guardada y traer la versión nueva de verdad.
+const CACHE_NAME = "openhands-cache-v2";
 const APP_SHELL_FILES = [
   "./",
   "./index.html",
@@ -28,7 +31,7 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) {
-    return; // las peticiones a MediaPipe/PeerJS van directo a la red
+    return;
   }
 
   event.respondWith(
