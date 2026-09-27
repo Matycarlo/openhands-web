@@ -1372,7 +1372,7 @@ function getVelocityMagnitude(sample) {
   }
   return 0;
 }
-const RECORDING_TIMEOUT_MS = 10000;
+const RECORDING_TIMEOUT_MS = 12000;
 
 let isRecording = false;
 let captureBuffer = [];
@@ -1411,7 +1411,7 @@ function startRecordingSamples() {
   clearTimeout(recordingTimeoutId);
   recordingTimeoutId = setTimeout(() => {
     if (isRecording) {
-      abortRecording("Se agotó el tiempo (8 segundos) sin completar la grabación.");
+      abortRecording("Se agotó el tiempo (12 segundos) sin completar la grabación.");
     }
   }, RECORDING_TIMEOUT_MS);
 }
