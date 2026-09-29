@@ -1,5 +1,31 @@
 import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
+// =============================================================================
+// CAMBIO DE ESTA VERSIÓN: VIDEO REMOTO NEGRO EN LA VIDEOLLAMADA
+//
+// Síntoma: el estado decía "Llamada en curso" (o sea, la conexión SÍ se
+// establecía y el video SÍ llegaba), pero el recuadro se veía negro/vacío.
+//
+// Causa: los navegadores bloquean la reproducción automática de un <video>
+// que tiene sonido si no viene de un clic directo justo en ese instante.
+// El lado que RECIBE la llamada asigna el video de forma asíncrona (después
+// de negociar la conexión con el otro), no directamente dentro de un
+// evento de clic — así que el navegador lo deja con la imagen asignada
+// pero nunca lo reproduce. Por fuera, eso se ve exactamente como un
+// recuadro negro aunque todo lo demás funcione bien.
+//
+// Arreglo: ahora se llama explícitamente a .play() al recibir el video. Si
+// el navegador lo bloquea por tener sonido, se reintenta SILENCIADO (eso sí
+// lo permite cualquier navegador) y se le avisa al usuario que toque el
+// video para activar el audio — un toque sí cuenta como interacción
+// directa, así que ahí sí se puede activar el sonido sin problema.
+//
+// También se agregaron varios servidores STUN públicos adicionales (antes
+// solo se usaba el que trae PeerJS por defecto) para mejorar las
+// probabilidades de conectar cuando alguna de las dos redes tiene un NAT
+// más restrictivo (redes móviles, wifi de oficina, etc.).
+// =============================================================================
+
 // ---------------- Instalable como app (PWA) ----------------
 
 if ("serviceWorker" in navigator) {
@@ -860,13 +886,6 @@ function augmentSample(vector) {
     const relPos = vector.slice(HAND_VECTOR_LENGTH * 2);
 
     for (let c = 0; c < AUGMENTATION_COPIES; c++) {
-      // FIX: antes cada mano se rotaba con un ángulo aleatorio
-      // INDEPENDIENTE y relPos no se tocaba — eso generaba muestras
-      // sintéticas físicamente imposibles (dos manos vistas desde ángulos
-      // de cámara distintos a la vez, con una posición relativa que no
-      // correspondía a ninguno de los dos). Ahora se usa UNA sola
-      // rotación compartida para ambas manos y para relPos, simulando un
-      // único ángulo de cámara sintético coherente.
       const matrix = randomRotationMatrix(AUGMENTATION_MAX_DEGREES);
       const augA = augmentHandFeatureVectorWithMatrix(featA, matrix);
       const augB = augmentHandFeatureVectorWithMatrix(featB, matrix);
@@ -1499,15 +1518,6 @@ function finishRecordingSamples(success) {
   }
 
   // ---- Recortar arranque/frenado casi quietos en señas con movimiento ----
-  // Si grabas una seña con movimiento (mano abierta moviéndose de lado a
-  // lado, por ejemplo), los primeros y últimos fotogramas de la grabación
-  // suelen tener velocidad casi nula (el instante justo antes de arrancar
-  // o justo después de frenar). Esos fotogramas, guardados tal cual, quedan
-  // CASI IDÉNTICOS a una seña estática de la misma forma de mano (misma
-  // pose + velocidad ~0) — eso es justo lo que causaba que reconociera
-  // "mano quieta" quieta al hacer la versión en movimiento. Los recortamos
-  // ANTES de guardar, para que esta seña solo aporte al vocabulario
-  // fotogramas donde realmente hay movimiento.
   const movementValues = consistentSamples.map(getVelocityMagnitude);
   const avgMovement = movementValues.reduce((a, b) => a + b, 0) / movementValues.length;
   const isDynamicRecording = avgMovement >= DYNAMIC_RECORDING_THRESHOLD;
@@ -1789,30 +1799,8 @@ function updateRecognitionStatus(candidate, distance, threshold) {
 }
 
 const FAST_CONFIRM_DISTANCE_RATIO = 0.8;
-// Con 1 solo frame bastaba para confirmar por la vía rápida. El problema:
-// el instante justo antes de empezar a mover la mano (o una micro-pausa a
-// mitad del movimiento) tiene velocidad ~0 y la MISMA forma de mano que una
-// seña estática — son, literalmente, el mismo punto en el espacio de
-// características por un instante. Exigir 3 frames seguidos (~120ms a 24
-// detecciones/seg) le da tiempo a que el movimiento real se distinga antes
-// de confirmar, sin notarse como demora para el usuario.
 const FAST_CONFIRM_FRAMES = 3;
 const FAST_CONFIRM_MAX_TOLERATED_MISSES = 2;
-// REPEAT_CONFIRM_COOLDOWN_MS: cuánto esperar antes de volver a confirmar la
-// MISMA palabra (para no repetirla en cascada mientras mantienes la seña).
-//
-// NEW_WORD_CONFIRM_COOLDOWN_MS: cuánto esperar como MÍNIMO antes de
-// confirmar una palabra DISTINTA a la última. Antes esto no existía — el
-// código dejaba pasar una palabra nueva sin importar el tiempo transcurrido
-// ("isNewCandidate || cooldownElapsed" hacía que cooldownElapsed nunca
-// importara si la palabra era distinta). Ese era el bug real detrás de
-// "hice una seña con movimiento y me tiró la palabra estática Y la de
-// movimiento casi a la vez": el arranque de la seña (quieto) confirmaba la
-// palabra estática, y apenas 100-200ms después, ya en movimiento,
-// confirmaba también la de movimiento — sin ninguna pausa mínima entre
-// ambas. Con este cooldown corto (pero real) entre CUALQUIER par de
-// palabras distintas, ese doble disparo casi instantáneo queda filtrado,
-// sin notarse como demora entre señas distintas hechas a ritmo normal.
 const REPEAT_CONFIRM_COOLDOWN_MS = 1200;
 const NEW_WORD_CONFIRM_COOLDOWN_MS = 450;
 
@@ -1821,12 +1809,6 @@ let fastConfirmStreak = 0;
 let fastConfirmMissStreak = 0;
 let lastConfirmedAtMs = 0;
 
-// Si ha pasado un buen rato desde la última palabra confirmada, "olvidamos"
-// confirmedLabel antes de clasificar. Sin esto, el empujón de histéresis
-// (STICKY_LABEL_BONUS) seguiría favoreciendo indefinidamente a la última
-// palabra que confirmaste, aunque ya hayas soltado la mano y estés
-// probando una seña totalmente distinta minutos después — dándole a esa
-// seña nueva una desventaja injusta en los empates.
 const CONFIRMED_LABEL_IDLE_RESET_MS = 2500;
 
 function processRecognition(vector) {
@@ -2047,6 +2029,22 @@ function stopDraggingRemoteVideo() {
 remoteVideoBox.addEventListener("pointerup", stopDraggingRemoteVideo);
 remoteVideoBox.addEventListener("pointercancel", stopDraggingRemoteVideo);
 
+// Toca el recuadro del video remoto para activar el audio si el navegador
+// lo dejó silenciado por la política de autoplay (ver attachCallHandlers).
+// Un clic/toque cuenta como interacción directa del usuario, así que aquí
+// sí se puede desmutear sin que el navegador lo bloquee.
+remoteVideoBox.addEventListener("click", () => {
+  if (remoteVideoPreview.muted) {
+    remoteVideoPreview.muted = false;
+    remoteVideoPreview.play().catch((error) => {
+      console.warn("No se pudo activar el audio del video remoto:", error);
+    });
+    if (callStatus.textContent.includes("activar el audio")) {
+      callStatus.textContent = "Llamada en curso.";
+    }
+  }
+});
+
 let peer = null;
 let currentCall = null;
 let dataConnection = null;
@@ -2067,7 +2065,24 @@ function initPeer() {
     return;
   }
 
-  peer = new Peer();
+  // Se añaden varios servidores STUN públicos, además del que trae PeerJS
+  // por defecto, para mejorar las probabilidades de conectar cuando alguna
+  // de las dos redes tiene un NAT más restrictivo (redes móviles, wifi de
+  // oficina, etc.). Si la llamada sigue sin conectar en redes muy
+  // restrictivas, el siguiente paso sería agregar un servidor TURN (ya no
+  // es solo STUN), pero eso normalmente requiere un servicio de pago o
+  // propio.
+  peer = new Peer(undefined, {
+    config: {
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun3.l.google.com:19302" },
+        { urls: "stun:stun4.l.google.com:19302" },
+      ],
+    },
+  });
 
   peer.on("open", (id) => {
     myPeerIdInput.value = id;
@@ -2087,9 +2102,6 @@ function initPeer() {
   peer.on("error", (error) => {
     console.error("Error de PeerJS:", error);
     callStatus.textContent = `Error de conexión: ${error.type || error.message}`;
-    // Antes esto podía dejar los botones de llamada en un estado
-    // ambiguo (ej. "Colgar" visible sin llamada real). endCall() es
-    // seguro de llamar aunque no haya nada activo.
     endCall();
   });
 }
@@ -2131,6 +2143,27 @@ function attachCallHandlers(call) {
     callStatus.textContent = "Llamada en curso.";
     hangUpButton.style.display = "block";
     callButton.style.display = "none";
+
+    // Algunos navegadores bloquean la reproducción automática de un video
+    // que trae sonido si no viene de un clic directo justo en ese instante
+    // — algo muy común del lado que RECIBE la llamada, ya que el stream
+    // llega de forma asíncrona después de negociar la conexión, no dentro
+    // de un evento de clic. Sin este manejo, el video queda con la imagen
+    // asignada pero nunca se reproduce (se ve negro) aunque la llamada
+    // "esté en curso". Si el navegador lo bloquea, lo reproducimos primero
+    // SIN sonido (eso sí lo permite cualquier navegador) y avisamos para
+    // que un toque sobre el recuadro active el audio.
+    const playPromise = remoteVideoPreview.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch((error) => {
+        console.warn("Reproducción automática con sonido bloqueada, reintentando silenciado:", error);
+        remoteVideoPreview.muted = true;
+        remoteVideoPreview.play().catch((mutedError) => {
+          console.error("No se pudo reproducir el video remoto ni siquiera silenciado:", mutedError);
+        });
+        callStatus.textContent = "Llamada en curso (toca el video para activar el audio).";
+      });
+    }
   });
   call.on("close", endCall);
   call.on("error", (error) => {
